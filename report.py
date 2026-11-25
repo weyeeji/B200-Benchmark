@@ -6,6 +6,9 @@ from html import escape
 from pathlib import Path
 from urllib.parse import quote
 
+from report_charts import CHART_CSS, profile_charts
+from report_trends import TREND_CSS, output_trend
+
 SCHEMA = 1
 NA = "N/A"
 STATS = ("mean", "p50", "p90", "p95", "p99")
@@ -36,6 +39,8 @@ section, details { background: #fff; border: 1px solid #d4e2de; border-radius: 1
 details { background: #fafcfb; }
 details[open] summary { margin-bottom: 12px; }
 summary { cursor: pointer; font-weight: 700; overflow-wrap: anywhere; }
+.chart-profile > summary { color: #205d50; font-size: 16px; }
+.chart-profile { padding: 12px; margin-top: 12px; scroll-margin-top: 16px; }
 .scroll { overflow-x: auto; }
 table { border-collapse: collapse; width: 100%; font-size: 13px; font-variant-numeric: tabular-nums; }
 th, td { padding: 8px 10px; border-bottom: 1px solid #dde8e4; text-align: right; white-space: nowrap; }
@@ -164,6 +169,22 @@ def point_details(row, combined):
             f"<p><small>{' · '.join(checks)}</small></p>{latencies}{figures}</details>")
 
 
+def chart_section(rows, combined):
+    groups = defaultdict(list)
+    for row in rows:
+        groups[str(row.get("profile") or NA)].append(row)
+    panels = []
+    for index, (profile, matching) in enumerate(sorted(groups.items())):
+        matching.sort(key=lambda row: (row.get("concurrency") or 0, str(row.get("deployment") or ""),
+                                       str(row.get("run_source") or ""), row.get("repeat") or 0))
+        visible = " open" if len(groups) <= 2 or index == 0 else ""
+        panels.append(f'<details class="chart-profile"{visible}><summary>{escape(profile)}</summary>'
+                      f'{profile_charts(matching, combined=combined, scale_rows=rows)}'
+                      f'{output_trend(matching, combined, scale_rows=rows)}</details>')
+    note = "<small>同一指标在各场景使用共同刻度。</small>" if len(groups) > 1 else ""
+    return f'<section id="charts"><h2>图表</h2>{note}{"".join(panels)}</section>'
+
+
 def write_report(path, rows, *, combined=False):
     """Write one report atomically. Caller retains ownership of raw artifacts."""
     path = Path(path)
@@ -176,7 +197,10 @@ def write_report(path, rows, *, combined=False):
         ("未完成", sum(row.get("status") == "incomplete" for row in rows)),
     )
     cards = "".join(f"<div>{label}<strong>{value}</strong></div>" for label, value in counts)
-    nav = "" if combined else '<nav><a href="summary.csv">CSV</a><a href="summary.json">JSON</a></nav>'
+    links = '<a href="#charts">图表</a><a href="#table">明细</a>'
+    if not combined:
+        links += '<a href="summary.csv">CSV</a><a href="summary.json">JSON</a>'
+    nav = f"<nav>{links}</nav>"
     notes = coverage_notes(rows) if combined else []
     warnings = ("<section><h2>比较条件</h2><ul>" +
                 "".join(f"<li>{escape(note)}</li>" for note in notes) +
@@ -184,11 +208,12 @@ def write_report(path, rows, *, combined=False):
     details = "".join(point_details(row, combined) for row in rows)
     document = f"""<!doctype html>
 <html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title}</title><style>{CSS}</style>
+<title>{title}</title><style>{CSS}{CHART_CSS}{TREND_CSS}</style>
 <body><main>
 <header><h1>{title}</h1><p>{escape(model)}</p>{nav}</header>
 <div class="cards">{cards}</div>{warnings}
-<section><h2>测试点</h2>{overview(rows, combined)}
+{chart_section(rows, combined)}
+<section id="table"><h2>测试点</h2>{overview(rows, combined)}
 <p><small>吞吐使用稳态完成窗。全量延迟包含 drain 完成的请求。ITL 分位以逐请求平均 ITL 计算。</small></p>
 </section>
 <section><h2>延迟分布与采集口径</h2>{details}</section>

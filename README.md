@@ -93,7 +93,7 @@ python benchmark.py run --config config.local.json --scenes P01 --concurrencies 
 
 ## 指标与产物
 
-每个实验写入独立的 `results/run-…/` 或 `results/pilot-…/`。用 `report.html` 浏览测试点表格和可展开的延迟分布。机器可读汇总为 `summary.csv` 和 `summary.json`，另存环境版本和代码哈希。每个测试点的 `warmup/` 和 `formal/` 保存独立的 AIPerf 原始响应、记录、汇总、配置与日志。另有数据 manifest、Hook 回执和运行状态。逐请求错误可在 AIPerf 记录的 error 字段检索。
+每个实验写入独立的 `results/run-…/` 或 `results/pilot-…/`。打开 `report.html` 可按场景查看吞吐条形图、延迟分位图和请求完成情况。已有至少两个并发档位时，同时绘制稳态输出吞吐的扩展趋势。图下保留测试点表格和可展开的分位数明细。HTML 可离线打开。机器可读汇总为 `summary.csv` 和 `summary.json`，另存环境版本和代码哈希。每个测试点的 `warmup/` 和 `formal/` 保存独立的 AIPerf 原始响应、记录、汇总、配置与日志。另有数据 manifest、Hook 回执和运行状态。逐请求错误可在 AIPerf 记录的 error 字段检索。
 
 `status=complete` 表示压测执行和长度校验完成。用于严格对照的测试点要求 GPU、CPU、SSD 各级缓存清理确认，以及已通过的强制 EOS 对照。缺少验证时，报告会保留测量值并标注原因。部署变更后重新执行 EOS 探针。
 

@@ -238,7 +238,8 @@ def metadata(directory, cfg, kind):
     write_json(directory / "config.json", cfg)
     packages = {dist.metadata["Name"]: dist.version for dist in importlib.metadata.distributions()}
     paths = [HOME / name for name in ("benchmark.py", "runner.py", "dataset.py", "metrics.py",
-                                     "measure_cache.py", "capacity_metrics.py", "report.py", "requirements.txt")]
+                                     "measure_cache.py", "capacity_metrics.py", "report.py",
+                                     "report_charts.py", "report_trends.py", "requirements.txt")]
     write_json(directory / "experiment.json", {
         "created_utc": utc_now(), "kind": kind, "python": sys.version,
         "platform": platform.platform(), "host": platform.node(),
@@ -430,6 +431,7 @@ def compare_reports(paths, cfg):
         raise ValueError("Pass --from-run followed by one or more run directories")
     rows = []
     seen = set()
+    labels = set()
     for supplied in paths:
         directory = supplied.expanduser().resolve()
         if directory in seen:
@@ -440,7 +442,13 @@ def compare_reports(paths, cfg):
             not isinstance(row, dict) or row.get("report_schema") != result_report.SCHEMA for row in raw
         ):
             raise ValueError(f"Unsupported summary metric schema: {directory}")
-        rows.extend(row | {"run_source": directory.name} for row in raw)
+        label = directory.name
+        suffix = 2
+        while label in labels:
+            label = f"{directory.name} ({suffix})"
+            suffix += 1
+        labels.add(label)
+        rows.extend(row | {"run_source": label} for row in raw)
     rows.sort(key=lambda row: (row["profile"], row["concurrency"], row["run_source"], row["repeat"]))
     directory = Path(cfg["output_dir"])
     directory.mkdir(parents=True, exist_ok=True)
