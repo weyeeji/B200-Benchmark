@@ -256,16 +256,19 @@ def _order(group_count, total, seed):
         remaining -= min(remaining, group_count)
 
 
-def _generate(directory, settings, requests, tokenizer_path, tokenizer_hashes):
+def _generate(directory, settings, requests, tokenizer_path, tokenizer_hashes, *, phase_orders=None):
     encode, pool = _tokenizer(
         tokenizer_path, settings["chat_encoder"], json.dumps(settings["chat_template_kwargs"], sort_keys=True),
         json.dumps(tokenizer_hashes, sort_keys=True),
     )
     profile = settings["profile"]
     seed = settings["seed"]
-    isl, osl, prefix_size = PROFILES[profile]
+    isl, prefix_size = settings["isl"], settings["prefix_tokens"]
+    osl = settings["osl"]
     group_count = settings["prefix_groups"]
     scenario_seed = "P03/P04" if group_count else profile
+    if phase_orders is not None:
+        scenario_seed = "cache-capacity"
     anchor_a, anchor_b = pool[0], pool[-1]
     first, second = encode(anchor_a), encode(anchor_b)
     template_head = _common_length(first, second)
@@ -301,7 +304,10 @@ def _generate(directory, settings, requests, tokenizer_path, tokenizer_hashes):
     with (directory / "order.jsonl").open("w", encoding="utf-8") as orders:
         for phase, total in requests.items():
             with (directory / f"{phase}.jsonl").open("w", encoding="utf-8") as records:
-                order = _order(group_count, total, _seed(seed, scenario_seed, phase, "order"))
+                order = (
+                    phase_orders[phase] if phase_orders is not None
+                    else _order(group_count, total, _seed(seed, scenario_seed, phase, "order"))
+                )
                 for index, group in enumerate(order):
                     rng = random.Random(_seed(seed, scenario_seed, phase, "prompt", index))
                     shared, prefix_digest = ("", None) if group is None else group_prefix(group)
@@ -353,6 +359,68 @@ def _check_point(directory, settings, requests):
         "warmup": directory / "warmup.jsonl",
         "order": directory / "order.jsonl",
     }
+
+
+def prepare_capacity_trial(config, directory, groups, seed, osl):
+    """Materialize an anchor, one fill per competing group and a fresh anchor probe."""
+    if type(groups) is not int or groups < 1:
+        raise ValueError("Calibration requires a positive number of prefix groups")
+    if type(seed) is not int or seed < 0:
+        raise ValueError("Calibration seed must be a nonnegative integer")
+    if type(osl) is not int or osl < 1:
+        raise ValueError("Calibration OSL must be a positive integer")
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    files = ("prime.jsonl", "fill.jsonl", "probe.jsonl", "order.jsonl")
+    manifest = directory / "manifest.json"
+    if any((directory / name).exists() for name in (*files, manifest.name)):
+        raise FileExistsError(f"Calibration trial dataset already exists in {directory}")
+
+    tokenizer_path = Path(config["tokenizer"]).expanduser().resolve()
+    renderer = config.get("chat_encoder", "deepseek")
+    tokenizer_hashes = _tokenizer_hashes(tokenizer_path, renderer)
+    isl, _, prefix_size = PROFILES["P03"]
+    settings = {
+        "dataset_version": DATASET_VERSION,
+        "profile": "P03",
+        "seed": seed,
+        "isl": isl,
+        "osl": osl,
+        "prefix_tokens": prefix_size,
+        "prefix_groups": groups,
+        "chat_encoder": renderer,
+        "chat_template_kwargs": config.get("chat_template_kwargs") or {},
+        "tokenizer_sha256": tokenizer_hashes,
+    }
+    fill_order = list(range(1, groups))
+    random.Random(_seed(seed, "cache-capacity", "fill")).shuffle(fill_order)
+    phase_orders = {"prime": [0], "fill": fill_order, "probe": [0]}
+    requests = {phase: len(order) for phase, order in phase_orders.items()}
+    with TemporaryDirectory(prefix=".building-", dir=directory) as temporary:
+        staging = Path(temporary)
+        checks = _generate(
+            staging, settings, requests, tokenizer_path, tokenizer_hashes, phase_orders=phase_orders,
+        )
+        result = {
+            "purpose": "gpu_prefix_cache_capacity",
+            "settings": settings,
+            "groups": groups,
+            "seed": seed,
+            "isl": isl,
+            "osl": osl,
+            "prefix_tokens": prefix_size,
+            "requests": requests,
+            "tokenizer_version": importlib.metadata.version("tokenizers"),
+            "tokenizer_path_at_generation": str(tokenizer_path),
+            "generator_sha256": sha256(Path(__file__).resolve()),
+            "validation": checks,
+            "files": {name: sha256(staging / name) for name in files},
+        }
+        _write_json(staging / manifest.name, result)
+        for name in (*files, manifest.name):
+            (staging / name).replace(directory / name)
+    return {**result, "manifest": manifest, **{name[:-6]: directory / name for name in files}}
 
 
 def prepare(config, root, profile, concurrency, *, create=True):

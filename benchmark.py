@@ -16,6 +16,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import dataset
+import measure_cache
 import metrics
 from runner import (SLA_TAGS, clear_cache, probe_eos, recommended_duration, run_aiperf,
                     sha256, utc_now, verify_dispatch, write_json)
@@ -43,7 +44,7 @@ DEFAULTS = {
 
 def options():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["prepare", "plan", "probe", "pilot", "run"])
+    parser.add_argument("action", choices=["prepare", "plan", "probe", "measure-cache", "pilot", "run"])
     parser.add_argument("--config", type=Path, default=HOME / "config.example.json")
     parser.add_argument("--api-url")
     parser.add_argument("--model")
@@ -60,6 +61,7 @@ def options():
     parser.add_argument("--out-dir", dest="output_dir")
     parser.add_argument("--eos-probe-file")
     parser.add_argument("--eos-token-id", type=int, help="EOS ID override for probe")
+    measure_cache.add_arguments(parser)
     return parser.parse_args()
 
 
@@ -132,7 +134,7 @@ def load_config(args):
                 or parsed.username is not None or parsed.query or parsed.fragment):
             raise ValueError("api_url must be an HTTP(S) origin, optionally ending in /v1/chat/completions or /v1")
         cfg["api_url"] = url
-    elif args.action in ("probe", "pilot", "run"):
+    elif args.action in ("probe", "measure-cache", "pilot", "run"):
         raise ValueError("Pass --api-url or set api_url in the configuration")
     return cfg
 
@@ -163,7 +165,7 @@ def metadata(directory, cfg, kind):
     write_json(directory / "config.json", cfg)
     packages = {dist.metadata["Name"]: dist.version for dist in importlib.metadata.distributions()}
     paths = [HOME / name for name in ("benchmark.py", "runner.py", "dataset.py", "metrics.py",
-                                     "requirements.txt")]
+                                     "measure_cache.py", "capacity_metrics.py", "requirements.txt")]
     write_json(directory / "experiment.json", {
         "created_utc": utc_now(), "kind": kind, "python": sys.version,
         "platform": platform.platform(), "host": platform.node(),
@@ -310,12 +312,31 @@ def run_experiment(cfg, points, kind):
         return int(any(row["status"] == "incomplete" for row in rows))
 
 
+def run_cache_measurement(args, cfg):
+    version = importlib.metadata.version("aiperf")
+    if version != VERSION:
+        raise ValueError(f"Expected AIPerf {VERSION}, found {version}")
+    url = measure_cache.validate_options(args, cfg)
+    output = Path(cfg["output_dir"])
+    output.mkdir(parents=True, exist_ok=True)
+    with (HOME / ".benchmark.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        run_id = utc_now().split(".", 1)[0].replace(":", "")
+        nonce = uuid.uuid4()
+        directory = output / f"cache-capacity-{run_id}-{nonce.hex[:8]}"
+        directory.mkdir()
+        metadata(directory, cfg, "measure-cache")
+        return measure_cache.run_calibration(args, cfg, directory, url, cfg["seed"] ^ nonce.int)
+
+
 def main():
     args = options()
     try:
         cfg = load_config(args)
         if args.action == "probe":
             return run_probe(args, cfg)
+        if args.action == "measure-cache":
+            return run_cache_measurement(args, cfg)
         points = []
         for profile in cfg["scenes"]:
             for concurrency in cfg["concurrencies"]:

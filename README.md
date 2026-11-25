@@ -24,6 +24,23 @@ cp config.example.json config.local.json
 
 在 `deployment.name` 写入部署标识，在 `deployment.details` 记录 PD 拓扑、TP/DP/EP、缓存层、调度和算子优化等信息。使用 `deployment.speculative.mode` 的 `off`、`real`、`simulated` 或 `unknown`，并记录算法、草稿长度和模拟接受长度。配置仅用来标注实验。
 
+## 校准 GPU 前缀缓存容量 C
+
+在六卡基准部署可独占的时段运行容量校准。API 地址填写后续正式压测使用的入口。指标地址需要覆盖该入口路由到的全部 vLLM engine。下列地址是占位符，省略 `--metrics-url` 时默认读取 API origin 的 `/metrics`。
+
+```bash
+.venv/bin/python benchmark.py measure-cache --config config.local.json \
+  --api-url http://baseline.example:8000 \
+  --metrics-url http://vllm-metrics.example:8000/metrics \
+  --max-groups 32
+```
+
+每个候选工作集大小使用新生成的文本。AIPerf 以并发 1 闭环发送请求，先写入前缀 A，再写入 N−1 个独立前缀，最后用新后缀读回 A。每条请求的输入为 65,536 Token，其中前缀为 58,880 Token。短输出默认 8 Token，可用 `--calibration-osl` 指定。命中量取读回前后 vLLM `vllm:prompt_tokens_cached_by_source_total{source="device"}` 的增量。脚本按 engine 检查请求计数、首写与读回的路由，发现计数器异常、其他请求干扰或路由不稳定时记录为无法判定。 [vLLM 指标文档](https://docs.vllm.ai/en/latest/usage/metrics/#general-metrics)
+
+先测单组的实际 GPU 命中量，再逐档扩大组数并细测通过和失败的边界。每档默认重复 3 次，由 `--calibration-trials` 配置。默认通过阈值是单组基准命中量的 95%，由 `--hit-fraction` 配置。结果保存在 `results/cache-capacity-*/capacity.json`，其中 `lower_bound_tokens` 对应最大通过工作集，`first_failed_working_set_tokens` 对应最小失败工作集。状态为 `measured` 时，`cache_capacity_tokens` 给出可用的 C。达到扫描上限仍全部通过时，报告下界，可提高 `--max-groups` 后复测。
+
+把 `cache_capacity_tokens` 写入基准配置，或在 `prepare --scenes P03 P04 --cache-capacity "$C"` 中传入。校准使用独立目录，正式数据集沿用首次冻结的内容和顺序。当前四卡服务的测量值只适用于该四卡部署。
+
 ## 数据与流程
 
 | 场景 | ISL | OSL | 理论共享前缀 | 剩余输入 | 工作集 |
