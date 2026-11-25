@@ -14,6 +14,13 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 ARTIFACT = "profile_export"
+AFFINITY_ENV = {
+    "x-session-id": "AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID",
+    "x-session-affinity": "AIPERF_HTTP_X_SESSION_AFFINITY_FROM_CORRELATION_ID",
+    "x-smg-routing-key": "AIPERF_HTTP_X_SMG_ROUTING_KEY_FROM_CORRELATION_ID",
+    "x-dynamo-session-id": "AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID",
+    "x-dynamo-parent-session-id": "AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID",
+}
 SLA_TAGS = {
     "ttft_ms": "time_to_first_token",
     "tpot_ms": "full_response_inter_token_latency",
@@ -92,18 +99,41 @@ def aiperf_command(cfg, dataset_file, artifact, count, concurrency, duration=Non
     return command
 
 
+def aiperf_env(key_var, headers=None):
+    env = os.environ.copy()
+    key = env.pop(key_var, None) if key_var else None
+    for name in ("OPENAI_API_KEY", "AIPERF_INJECTED_API_KEY", "AIPERF_INJECTED_HEADERS",
+                 "AIPERF_INJECTED_ENDPOINT_URLS", "AIPERF_INJECTED_DATASET_URLS"):
+        env.pop(name, None)
+    # Keep the standard AIPerf routing defaults. Explicit calibration headers
+    # must take precedence over generated headers with the same name.
+    env.update({variable: str(header == "x-session-affinity").lower()
+                for header, variable in AFFINITY_ENV.items()})
+    for name in headers or {}:
+        if variable := AFFINITY_ENV.get(name.lower()):
+            env[variable] = "false"
+    if key:
+        env["OPENAI_API_KEY"] = key
+    env["HF_HUB_OFFLINE"] = "1"
+    env["TRANSFORMERS_OFFLINE"] = "1"
+    return env
+
+
 def run_aiperf(cfg, dataset_file, artifact, count, concurrency, duration=None, monitor=False, *, headers=None):
     artifact.mkdir()
     command = aiperf_command(cfg, dataset_file, artifact, count, concurrency, duration, monitor, headers=headers)
-    env = os.environ.copy()
-    key_var = cfg["api_key_env"]
-    key = env.get(key_var) if key_var else None
-    env.pop("OPENAI_API_KEY", None)
-    env.pop("AIPERF_INJECTED_API_KEY", None)
-    if key:
-        env["AIPERF_INJECTED_API_KEY"] = key
-    env["HF_HUB_OFFLINE"] = "1"
-    env["TRANSFORMERS_OFFLINE"] = "1"
+    env = aiperf_env(cfg["api_key_env"], headers)
+    if env.get("OPENAI_API_KEY"):
+        # The profile parent resolves authored config, then injects the key into
+        # its workers. Supplying the worker injection variable here is ignored.
+        auth_config = artifact / "aiperf-auth-config.json"
+        write_json(auth_config, {"schemaVersion": "2.0", "benchmark": {
+            "model": cfg["model"],
+            "endpoint": {"url": cfg["api_url"], "type": "chat", "api_key": "${OPENAI_API_KEY}"},
+            "dataset": {"type": "file", "path": str(dataset_file), "format": "single_turn"},
+            "phases": {"type": "concurrency", "requests": count, "concurrency": concurrency},
+        }})
+        command += ["--config", str(auth_config)]
 
     status = {"started_utc": utc_now(), "command": command,
               "target_requests": count, "concurrency": concurrency, "duration_cap_s": duration}
@@ -115,17 +145,25 @@ def run_aiperf(cfg, dataset_file, artifact, count, concurrency, duration=None, m
             try:
                 status["returncode"] = child.wait()
             except KeyboardInterrupt:
-                os.killpg(child.pid, signal.SIGINT)
+                terminate_group(child, signal.SIGINT)
                 try:
-                    child.wait(timeout=20)
+                    status["returncode"] = child.wait(timeout=20)
                 except subprocess.TimeoutExpired:
-                    os.killpg(child.pid, signal.SIGKILL)
-                    child.wait()
+                    terminate_group(child, signal.SIGKILL)
+                    status["returncode"] = child.wait()
+                status["interrupted"] = True
                 raise
     finally:
         status["finished_utc"] = utc_now()
         write_json(artifact / "invocation.json", status)
     return status["returncode"]
+
+
+def terminate_group(child, sig):
+    try:
+        os.killpg(child.pid, sig)
+    except ProcessLookupError:
+        pass
 
 
 def verify_dispatch(artifact, dataset_file):
@@ -136,18 +174,20 @@ def verify_dispatch(artifact, dataset_file):
     for record in jsonl(records):
         meta = record.get("metadata") or {}
         issued.append((meta.get("session_num"), meta.get("conversation_id"),
-                       meta.get("credit_issued_ns") or meta.get("request_start_ns")))
-    if not issued or any(not isinstance(item[0], int) for item in issued):
-        return {"status": "unverified_dispatch", "recorded": len(issued), "last_dispatch_s": None}
+                       meta.get("credit_issued_ns")))
+    result = {"status": "unverified_dispatch", "recorded": len(issued), "last_dispatch_s": None}
+    if not issued or any(type(num) is not int or not isinstance(cid, str)
+                         or type(ts) is not int or ts <= 0 for num, cid, ts in issued):
+        return result
     issued.sort(key=lambda item: item[0])
     planned = (row["session_id"] for row in jsonl(dataset_file))
     matched = all(num == index and conversation_id == next(planned, None)
                   for index, (num, conversation_id, _) in enumerate(issued))
-    timestamps = [x[2] for x in issued if isinstance(x[2], int) and x[2] > 0]
-    elapsed = ((max(timestamps) - min(timestamps)) / 1e9
-               if len(timestamps) > 1 else None)
-    return {"status": "ordered" if matched else "dispatch_mismatch",
-            "recorded": len(issued), "last_dispatch_s": elapsed}
+    timestamps = [item[2] for item in issued]
+    if not matched or any(previous > current for previous, current in zip(timestamps, timestamps[1:])):
+        return result | {"status": "dispatch_mismatch"}
+    elapsed = (timestamps[-1] - timestamps[0]) / 1e9 if len(timestamps) > 1 else None
+    return result | {"status": "ordered", "last_dispatch_s": elapsed}
 
 
 def clear_cache(cfg, artifact, profile, concurrency, repeat):
@@ -164,10 +204,15 @@ def clear_cache(cfg, artifact, profile, concurrency, repeat):
     path = artifact / "cache-hook.stdout.log"
     try:
         with path.open("wb") as out, (artifact / "cache-hook.stderr.log").open("wb") as err:
-            completed = subprocess.run(hook["command"], stdout=out, stderr=err, env=env,
-                                       timeout=hook["timeout_s"], check=False)
-        result["returncode"] = completed.returncode
-        if completed.returncode != 0:
+            child = subprocess.Popen(hook["command"], stdout=out, stderr=err, env=env,
+                                     start_new_session=True)
+            try:
+                result["returncode"] = child.wait(timeout=hook["timeout_s"])
+            except (subprocess.TimeoutExpired, KeyboardInterrupt):
+                terminate_group(child, signal.SIGKILL)
+                child.wait()
+                raise
+        if result["returncode"] != 0:
             result["detail"] = "Cache-clear hook returned a nonzero exit status."
         else:
             attestation = json.loads(path.read_text(encoding="utf-8"))

@@ -8,9 +8,11 @@ import statistics
 from collections import Counter, defaultdict
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 NA = "N/A"
 LATENCIES = ("ttft_ms", "tpot_ms", "itl_ms", "e2el_ms")
+ITL_STATISTIC = "percentiles_of_per_request_mean_token_intervals"
 
 # Family names and units follow AIPerf 0.14's server-metrics reference.
 CACHE_TIERS = ("gpu", "cpu", "ssd")
@@ -123,11 +125,16 @@ def latency(record, name):
     entry = (record.get("metrics") or {}).get(name, {})
     value = number(entry.get("value"))
     scale = {"ns": 1e-6, "us": 1e-3, "ms": 1, "s": 1e3}.get(entry.get("unit"))
-    return value * scale if value is not None and scale is not None else None
+    return value * scale if value is not None and value >= 0 and scale is not None else None
 
 
 def failed(record):
     return bool(record.get("error") or record["metadata"].get("was_cancelled"))
+
+
+def timed_out(record):
+    error = record.get("error") or {}
+    return "timeout" in str(error.get("type", "")).lower() or error.get("code") in (408, 504)
 
 
 def usage_count(record, field):
@@ -136,7 +143,10 @@ def usage_count(record, field):
 
 def record_counts(artifact_dir, *, isl, osl):
     """Use only server Usage for observed input/output lengths and EOS evidence."""
-    records = profiling_records(artifact_dir)
+    return counts_from_records(profiling_records(artifact_dir), isl, osl)
+
+
+def counts_from_records(records, isl, osl):
     success = [req for req in records if not failed(req)]
     observed_inputs = [usage_count(req, "prompt") for req in success]
     observed_outputs = [usage_count(req, "completion") for req in success]
@@ -244,6 +254,7 @@ def stats(values, name):
         for p in (50, 90, 95, 99)
     )
     base, unit = name.rsplit("_", 1)
+    calculations.append(("max", ordered[-1] if ordered else NA))
     return {f"{base}_{stat}_{unit}": value for stat, value in calculations}
 
 
@@ -256,24 +267,29 @@ def ratio(a, b, scale=1):
     return scale * a / b if a is not None and b is not None and b > 0 else NA
 
 
-def timed_request(record):
+def request_record(record):
     metadata = record["metadata"]
     start = metadata.get("request_start_ns")
-    if type(start) is not int or start <= 0:
-        return None
     ttft = latency(record, "time_to_first_token")
     decode = latency(record, "full_decode_duration")
     full_ms = ttft + decode if ttft is not None and decode is not None else None
-    wall_end = metadata.get("request_end_ns")
-    end = max(wall_end or start, start + round(full_ms * 1e6)) if full_ms is not None else wall_end
-    if type(end) is not int or end <= start:
-        return None
+    end = metadata.get("request_end_ns")
+    timing = "last_wire_event"
+    if type(start) is int and start > 0 and full_ms is not None:
+        http_end = start + round(full_ms * 1e6)
+        if type(end) is not int or http_end >= end - 1:
+            end, timing = max(http_end, end or 0), "http_completion"
+    cancellation = metadata.get("cancellation_time_ns")
+    if type(cancellation) is int and (type(end) is not int or cancellation > end):
+        end, timing = cancellation, "cancellation"
+    if type(start) is not int or start <= 0 or type(end) is not int or end < start:
+        start, end, timing = None, None, "unavailable"
+    e2el = (end - start) / 1e6 if start is not None else full_ms
     return {
         "start": start, "end": end,
         "failed": failed(record),
-        "timing": "http_completion" if full_ms is not None else "last_wire_event",
-        "timeout": "timeout" in str((record.get("error") or {}).get("type", "")).lower()
-                   or (record.get("error") or {}).get("code") in (408, 504),
+        "timing": timing,
+        "timeout": timed_out(record),
         "input": usage_count(record, "prompt"),
         "output": usage_count(record, "completion"),
         "reasoning": usage_count(record, "reasoning"),
@@ -285,7 +301,7 @@ def timed_request(record):
         "tpot_ms": latency(record, "full_response_inter_token_latency"),
         "itl_ms": latency(record, "inter_token_latency"),
         "user_tps": metric(record, "output_token_throughput_per_user"),
-        "e2el_ms": (end - start) / 1e6,
+        "e2el_ms": e2el,
         "itl_decode_ms": latency(record, "decode_duration"),
         "metadata": metadata,
         "spec_accepted": metric(record, "spec_decode_accepted_draft_tokens"),
@@ -304,30 +320,45 @@ def steady_window(requests, concurrency):
     last_send = max((req["start"] for req in requests), default=None)
     last_time = None
     integral = 0
+    target_duration = 0
     peak = 0
     for timestamp, change in sorted(events.items()):
         if steady_start is not None and last_time < last_send:
-            integral += active * (min(timestamp, last_send) - last_time)
+            elapsed = min(timestamp, last_send) - last_time
+            integral += active * elapsed
+            if active == concurrency:
+                target_duration += elapsed
         active += change
         if active >= concurrency and steady_start is None:
             steady_start = timestamp
         peak = max(peak, active)
         last_time = timestamp
     if steady_start is None or last_send <= steady_start:
-        return None, None, NA, peak if requests else NA
-    return steady_start, last_send, integral / (last_send - steady_start), peak
+        return None, None, NA, peak if requests else NA, NA
+    duration = last_send - steady_start
+    return steady_start, last_send, integral / duration, peak, target_duration / duration
+
+
+def endpoint_key(url):
+    """AIPerf appends /metrics to scrape URLs that have no path."""
+    parsed = urlsplit(url)
+    return urlunsplit(parsed._replace(path=parsed.path if parsed.path not in ("", "/") else "/metrics"))
 
 
 def select_samples(artifact_dir, start, end, rule_index, urls=()):
-    """Keep complete scrape observations inside the steady interval."""
+    """Retain the known series roster and complete observations inside the steady window."""
     series = defaultdict(lambda: defaultdict(list))
     if start is None or end is None:
         return series
+    urls = {endpoint_key(url) for url in urls}
     path = artifact_dir / "profile_export_server_metrics.jsonl"
     if not path.is_file():
         path = artifact_dir / "server_metrics_export.jsonl"
     for snapshot in jsonl(path):
         endpoint = snapshot.get("endpoint_url")
+        if not endpoint:
+            continue
+        endpoint = endpoint_key(endpoint)
         if urls and endpoint not in urls:
             continue
         timestamp = snapshot.get("timestamp_ns")
@@ -335,45 +366,76 @@ def select_samples(artifact_dir, start, end, rule_index, urls=()):
         if sent is None and type(timestamp) is int:
             latency = snapshot.get("endpoint_latency_ns")
             sent = timestamp - latency if type(latency) is int and latency >= 0 else timestamp
-        if type(timestamp) is not int or type(sent) is not int or not start <= sent <= timestamp <= end:
-            continue
+        in_window = type(timestamp) is int and type(sent) is int and start <= sent <= timestamp <= end
         snapshot_metrics = snapshot.get("metrics") or {}
         for family in snapshot_metrics.keys() & rule_index:
             for sample in snapshot_metrics[family]:
                 labels = tuple(sorted((sample.get("labels") or {}).items()))
-                series[family][(endpoint, labels)].append((timestamp, sample))
+                observations = series[family][(endpoint, labels)]
+                if in_window:
+                    observations.append((sent, sample))
     return series
+
+
+def series_value(observations, field, mode):
+    points = {}
+    for sent, sample in observations:
+        value = number(sample.get(field))
+        if value is None or (sent in points and points[sent] != value):
+            return None
+        points[sent] = value
+    times = tuple(sorted(points))
+    if not times:
+        return None
+    values = [points[sent] for sent in times]
+    if mode == "gauge":
+        return statistics.fmean(values), times
+    # Without a reset timestamp or a resolvable order, a decrease gives no exact delta.
+    if len(times) < 2 or values[0] < 0 or any(b < a for a, b in zip(values, values[1:])):
+        return None
+    delta = values[-1] - values[0]
+    return (delta / ((times[-1] - times[0]) / 1e9) if mode == "rate" else delta), times
 
 
 def timeseries_measure(series, family, field, mode, labels, label_regex, endpoints, ignore):
     values = {}
+    samples_by_endpoint = {}
     for (endpoint, series_labels), observations in series.get(family, {}).items():
-        label_map = dict(series_labels)
         if endpoints and endpoint not in endpoints:
             continue
+        label_map = dict(series_labels)
         if any(label_map.get(key) != value for key, value in labels.items()):
             continue
         if any(not re.fullmatch(pattern, label_map.get(key, "")) for key, pattern in label_regex.items()):
             continue
-        series_labels = tuple((key, value) for key, value in series_labels if key not in ignore)
-        points = sorted(
-            (timestamp, value) for timestamp, sample in observations
-            if (value := number(sample.get(field))) is not None
-        )
-        if not points:
-            continue
-        key = (endpoint, series_labels)
-        if mode == "gauge":
-            values[key] = values.get(key, 0) + statistics.fmean(value for _, value in points)
-            continue
-        duration = (points[-1][0] - points[0][0]) / 1e9
-        if duration > 0:
-            delta = sum(
-                current - previous if current >= previous else current
-                for (_, previous), (_, current) in zip(points, points[1:])
-            )
-            values[key] = values.get(key, 0) + (delta / duration if mode == "rate" else delta)
+        measure = series_value(observations, field, mode)
+        if measure is None:
+            return {}
+        value, times = measure
+        if endpoint in samples_by_endpoint and samples_by_endpoint[endpoint] != times:
+            return {}
+        samples_by_endpoint[endpoint] = times
+        key = endpoint, tuple((key, value) for key, value in series_labels if key not in ignore)
+        previous, _ = values.get(key, (0, times))
+        values[key] = previous + value, times
+    if endpoints and endpoints != samples_by_endpoint.keys():
+        return {}
+    if not comparable_scrape_windows(samples_by_endpoint.values()):
+        return {}
     return values
+
+
+def comparable_scrape_windows(windows):
+    """Allow polling skew when combining distinct endpoints on one steady window."""
+    if len(windows) < 2:
+        return True
+    start = min(times[0] for times in windows)
+    end = max(times[-1] for times in windows)
+    for times in windows:
+        tolerance = statistics.median(b - a for a, b in zip(times, times[1:])) if len(times) > 1 else 0
+        if times[0] - start > tolerance or end - times[-1] > tolerance:
+            return False
+    return True
 
 
 def evaluate_rule(series, rule):
@@ -381,7 +443,7 @@ def evaluate_rule(series, rule):
     denominator = rule.get("denominator")
     labels = rule.get("labels", {})
     label_regex = rule.get("label_regex", {})
-    endpoints = rule.get("endpoints", [])
+    endpoints = {endpoint_key(url) for url in rule.get("endpoints", [])}
     ignore = rule.get("ignore_labels", [])
     scale = rule.get("scale", 1)
 
@@ -390,8 +452,8 @@ def evaluate_rule(series, rule):
         return timeseries_measure(series, name, field, mode, selected_labels, label_regex, endpoints, ignore)
 
     def matched(a, b):
-        if a and a.keys() == b.keys():
-            return sum(a.values()), sum(b.values())
+        if a and a.keys() == b.keys() and all(a[key][1] == b[key][1] for key in a):
+            return sum(item[0] for item in a.values()), sum(item[0] for item in b.values())
         return None, None
 
     if kind in ("ratio", "ratio_plus_one", "histogram_ratio", "histogram_mean"):
@@ -411,13 +473,13 @@ def evaluate_rule(series, rule):
         a, b = matched(measure(family, "value", mode), measure(denominator, "value", mode, True))
         return (a - b) * scale if a is not None and b is not None and a >= b else NA
     if kind in ("gauge_sum", "gauge_mean"):
-        values = list(measure(family, "value", "gauge").values())
+        values = [item[0] for item in measure(family, "value", "gauge").values()]
         if not values:
             return NA
         return (statistics.fmean(values) if kind == "gauge_mean" else sum(values)) * scale
     field = "sum" if kind == "histogram_sum_rate" else "value"
     values = measure(family, field, "delta" if kind == "counter_delta" else "rate")
-    return sum(values.values()) * scale if values else NA
+    return sum(item[0] for item in values.values()) * scale if values else NA
 
 
 def server_summary(artifact_dir, start, end, config):
@@ -467,53 +529,71 @@ def summarize(artifact_dir, *, concurrency, gpu_count, isl, osl, sla=None,
     """Summarize successes and errors by completion during offered steady load."""
     artifact_dir = Path(artifact_dir)
     records = profiling_records(artifact_dir)
-    all_requests = [item for rec in records if (item := timed_request(rec)) is not None]
-    success = [req for req in all_requests if not req["failed"]]
+    parsed = [request_record(record) for record in records]
+    all_requests = [req for req in parsed if req["start"] is not None]
+    success = [req for req in parsed if not req["failed"]]
     finish_reasons = fill_from_raw(artifact_dir, success, tokenizer_path, input_token_count)
     for req in success:
-        if req["uncached"] is None and req["input_source"] == "server_usage" and req["cached"] is not None:
-            if req["cached"] <= req["input"]:
-                req["uncached"] = req["input"] - req["cached"]
-            else:
-                req["cached"] = None
+        total = req["input"] if req["input_source"] == "server_usage" else None
+        cached, uncached = req["cached"], req["uncached"]
+        if (
+            total is None or (cached is not None and cached > total)
+            or (uncached is not None and uncached > total)
+            or (cached is not None and uncached is not None and cached + uncached != total)
+        ):
+            req["cached"], req["uncached"] = None, None
+        elif cached is not None:
+            req["uncached"] = total - cached
+        elif uncached is not None:
+            req["cached"] = total - uncached
         # With no server Usage, approximate from tokenizer counts across joined text.
         if req["output_source"] == "client_tokenizer" and req["output"] > 1:
             if req["itl_decode_ms"] is not None:
                 req["itl_ms"] = req["itl_decode_ms"] / (req["output"] - 1)
-            if req["ttft_ms"] is not None:
+            if req["ttft_ms"] is not None and req["e2el_ms"] is not None and req["e2el_ms"] >= req["ttft_ms"]:
                 req["tpot_ms"] = (req["e2el_ms"] - req["ttft_ms"]) / (req["output"] - 1)
 
-    steady_start, steady_end, active_mean, active_peak = steady_window(all_requests, concurrency)
+    untimed = len(records) - len(all_requests)
+    steady_start, steady_end, active_mean, active_peak, target_fraction = (
+        steady_window(all_requests, concurrency) if not untimed else (None, None, NA, NA, NA)
+    )
     steady_duration = (steady_end - steady_start) / 1e9 if steady_start is not None else None
+    startup = [req for req in all_requests if steady_duration and req["end"] <= steady_start]
+    drain = [req for req in all_requests if steady_duration and req["end"] > steady_end]
     finalized = [req for req in all_requests if steady_start is not None
                  and steady_start < req["end"] <= steady_end]
     done = [req for req in finalized if not req["failed"]]
-    counts = record_counts(artifact_dir, isl=isl, osl=osl)
+    counts = counts_from_records(records, isl, osl)
     result = {
         **counts,
         "target_isl_tokens": isl,
         "target_osl_tokens": osl,
         "timed_requests": len(all_requests),
+        "untimed_requests": untimed,
         "http_completion_timestamp_requests": sum(req["timing"] == "http_completion" for req in all_requests),
         "steady_start_ns": steady_start if steady_start is not None else NA,
         "steady_end_ns": steady_end if steady_end is not None else NA,
         "steady_seconds": steady_duration if steady_duration is not None else NA,
+        "steady_end_source": "last_observed_request_start" if steady_duration else NA,
+        "startup_attempts": len(startup) if steady_duration else NA,
+        "startup_completed_requests": sum(not req["failed"] for req in startup) if steady_duration else NA,
         "steady_completed_requests": len(done) if steady_duration else NA,
         "steady_attempts": len(finalized) if steady_duration else NA,
-        "drain_completed_requests": sum(req["end"] > steady_end for req in all_requests) if steady_duration else NA,
+        "drain_attempts": len(drain) if steady_duration else NA,
+        "drain_completed_requests": sum(not req["failed"] for req in drain) if steady_duration else NA,
+        "drain_failed_requests": sum(req["failed"] for req in drain) if steady_duration else NA,
         "actual_concurrency_mean": active_mean,
+        "steady_concurrency_at_target_fraction": target_fraction,
         "actual_concurrency_peak": active_peak,
         "rps": ratio(len(done), steady_duration),
         "request_success_rate": ratio(len(done), len(finalized)),
         "timeout_rate": ratio(sum(req["timeout"] for req in finalized), len(finalized)),
         "error_rate": ratio(sum(req["failed"] for req in finalized), len(finalized)),
         "whole_run_request_success_rate": ratio(counts["completed_requests"], len(records)),
-        "whole_run_timeout_rate": ratio(sum(
-            "timeout" in str((record.get("error") or {}).get("type", "")).lower()
-            or (record.get("error") or {}).get("code") in (408, 504) for record in records
-        ), len(records)),
+        "whole_run_timeout_rate": ratio(sum(timed_out(record) for record in records), len(records)),
         "whole_run_error_rate": ratio(counts["failed_requests"], len(records)),
         "finish_reasons": json.dumps(dict(finish_reasons), sort_keys=True) if finish_reasons else NA,
+        "itl_statistic": ITL_STATISTIC,
     }
 
     for field, expected in (("input", isl), ("output", osl)):
@@ -531,7 +611,13 @@ def summarize(artifact_dir, *, concurrency, gpu_count, isl, osl, sla=None,
     result["observed_reasoning_lengths"] = len(actual_reasoning)
     result["actual_reasoning_mean_tokens"] = statistics.fmean(actual_reasoning) if actual_reasoning else NA
     for field in LATENCIES:
-        result.update(stats((req[field] for req in done), field))
+        label = field.removesuffix("_ms")
+        steady_values = [req[field] for req in done if req[field] is not None]
+        formal_values = [req[field] for req in success if req[field] is not None]
+        result.update(stats(steady_values, field))
+        result.update(stats(formal_values, f"formal_{field}"))
+        result[f"steady_{label}_samples"] = len(steady_values)
+        result[f"formal_{label}_samples"] = len(formal_values)
     input_tokens = complete_sum(req["input"] for req in done)
     output_tokens = complete_sum(req["output"] for req in done)
     cached_tokens = complete_sum(req["cached"] for req in done)
@@ -560,17 +646,8 @@ def summarize(artifact_dir, *, concurrency, gpu_count, isl, osl, sla=None,
     result["sla_pass_rate"] = ratio(good, len(finalized))
     result.update(server_summary(artifact_dir, steady_start, steady_end, prometheus or {}))
     for name in ("cached_input", "uncached_input"):
-        source = "server_usage" if result[f"{name}_tps"] != NA else NA
-        if source == NA and result[f"server_{name}_tps"] != NA:
-            source = "prometheus"
-            result[f"{name}_tps"] = result[f"server_{name}_tps"]
-            result[f"{name}_tpm"] = result[f"server_{name}_tps"] * 60
-            result[f"{name}_tokens"] = result[f"server_{name}_tokens"]
-        result[f"{name}_source"] = source
+        result[f"{name}_source"] = "server_usage" if result[f"{name}_tps"] != NA else NA
     result["actual_cache_hit_rate_source"] = "server_usage" if result["actual_cache_hit_rate"] != NA else NA
-    if result["actual_cache_hit_rate"] == NA and result["server_prefix_cache_hit_rate"] != NA:
-        result["actual_cache_hit_rate"] = result["server_prefix_cache_hit_rate"]
-        result["actual_cache_hit_rate_source"] = result["server_prefix_cache_hit_rate_source"]
 
     accepted = complete_sum(req["spec_accepted"] for req in done)
     steps = complete_sum(req["spec_steps"] for req in done)
@@ -580,7 +657,7 @@ def summarize(artifact_dir, *, concurrency, gpu_count, isl, osl, sla=None,
         result["spec_acceptance_length"] = 1 + acceptance
         result["spec_acceptance_length_source"] = "aiperf_request_records"
     acceptance_rate = ratio(accepted, draft)
-    if acceptance_rate != NA:
+    if acceptance_rate != NA and 0 <= acceptance_rate <= 1:
         result["spec_acceptance_rate"] = acceptance_rate
         result["spec_acceptance_rate_source"] = "aiperf_request_records"
     return result

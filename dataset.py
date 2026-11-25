@@ -9,6 +9,7 @@ import os
 import random
 import re
 from array import array
+from contextlib import nullcontext
 from functools import lru_cache
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -34,7 +35,13 @@ def _write_json(path, value):
 
 
 def _load_json(path):
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Invalid benchmark JSON: {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"Expected a JSON object: {path}")
+    return value
 
 
 def _jsonl(handle, value):
@@ -57,28 +64,94 @@ def _common_length(first, second):
     return min(len(first), len(second))
 
 
-def _groups(config, profile, archived):
+def _groups_for_capacity(profile, capacity):
+    prefix = PROFILES[profile][2]
+    if profile == "P03":
+        return capacity // (2 * prefix)
+    return (2 * capacity + prefix - 1) // prefix
+
+
+def _derived_capacity(profile, archived):
+    if archived is None:
+        return None
+    capacity = archived.get("baseline_cache_capacity_tokens")
+    origin = archived.get("prefix_groups_source")
+    if archived.get("profile") != profile or origin not in (None, "capacity", "explicit"):
+        raise ValueError(f"Invalid frozen prefix group source for {profile}")
+    if origin == "capacity":
+        if (
+            type(capacity) is not int or capacity <= 0
+            or archived.get("prefix_groups") != _groups_for_capacity(profile, capacity)
+        ):
+            raise ValueError(f"Invalid frozen baseline cache capacity for {profile}")
+        return capacity
+    if origin == "explicit" and capacity is not None:
+        raise ValueError(f"Explicit groups must not declare a derivation capacity for {profile}")
+    # Older archives did not store the origin. A matching formula is the
+    # available evidence that their group count was derived from this capacity.
+    if (
+        origin is None and type(capacity) is int and capacity > 0
+        and archived.get("prefix_groups") == _groups_for_capacity(profile, capacity)
+    ):
+        return capacity
+    return None
+
+
+def _groups(config, profile, archived, sibling):
     if not PROFILES[profile][2]:
-        return 0
-    groups = config.get("prefix_groups") or {}
-    count = groups.get(profile)
-    capacity = config.get("cache_capacity_tokens")
-    if capacity is not None and (type(capacity) is not int or capacity <= 0):
+        return 0, None, None
+    count = (config.get("prefix_groups") or {}).get(profile)
+    requested_capacity = config.get("cache_capacity_tokens")
+    if requested_capacity is not None and (type(requested_capacity) is not int or requested_capacity <= 0):
         raise ValueError("cache_capacity_tokens must be a positive integer")
-    if count is None and capacity is not None:
-        prefix = PROFILES[profile][2]
-        if profile == "P03":
-            count = capacity // (2 * prefix)
-        else:
-            count = (2 * capacity + prefix - 1) // prefix
-    if count is None and archived:
-        count = archived["prefix_groups"]
+    if count is not None and (type(count) is not int or count < 1):
+        raise ValueError(f"prefix_groups.{profile} must be a positive integer")
+    origin = None
+    if archived is not None:
+        baseline_capacity = archived.get("baseline_cache_capacity_tokens")
+        origin = archived.get("prefix_groups_source")
+        derived_capacity = _derived_capacity(profile, archived)
+        if derived_capacity is not None:
+            if sibling is not None and sibling != derived_capacity:
+                raise ValueError("P03 and P04 have different frozen derivation capacities; use a new dataset root")
+            if count is None and requested_capacity not in (None, derived_capacity):
+                raise ValueError(f"{profile} uses frozen baseline cache capacity {derived_capacity}")
+        if count is None:
+            count = archived.get("prefix_groups")
+    elif count is not None:
+        baseline_capacity = None
+        origin = "explicit"
+    else:
+        if sibling is not None and requested_capacity not in (None, sibling):
+            raise ValueError(
+                f"P03/P04 use frozen baseline cache capacity {sibling}; "
+                "use the same capacity or an explicit group count"
+            )
+        baseline_capacity = sibling if sibling is not None else requested_capacity
+        if baseline_capacity is not None:
+            count = _groups_for_capacity(profile, baseline_capacity)
+        origin = "capacity"
     if type(count) is not int or count < 1:
         raise ValueError(
             f"{profile} needs a positive prefix_groups.{profile} or a baseline "
             "cache_capacity_tokens yielding at least one group"
         )
-    return count
+    return count, baseline_capacity, origin
+
+
+def _archived_settings(profile_dir, preferred=None):
+    baseline_path = profile_dir / "baseline.json"
+    if baseline_path.is_file():
+        return _load_json(baseline_path)
+    # A point can commit before its baseline, and copied archives may omit it.
+    if preferred is None or not preferred.is_file():
+        preferred = next(iter(sorted(profile_dir.glob("c*/manifest.json"))), None)
+    if preferred is None:
+        return None
+    settings = _load_json(preferred).get("settings")
+    if not isinstance(settings, dict):
+        raise ValueError(f"Invalid frozen dataset settings: {preferred}")
+    return settings
 
 
 def _tokenizer_hashes(path, renderer):
@@ -112,9 +185,11 @@ def _tokenizer(path, renderer, kwargs_json, hashes_json):
     if renderer == "deepseek":
         backend = Tokenizer.from_file(str(path / "tokenizer.json"))
         encoder_name = next(name for name in json.loads(hashes_json) if name.startswith("encoding/"))
-        spec = importlib.util.spec_from_file_location("benchmark_chat_encoder", path / encoder_name)
+        encoder_path = path / encoder_name
+        spec = importlib.util.spec_from_file_location("benchmark_chat_encoder", encoder_path)
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        # Load current bytes even when an encoder edit preserves mtime and size.
+        exec(compile(encoder_path.read_bytes(), str(encoder_path), "exec"), vars(module))
         unknown = kwargs.keys() - {"thinking", "enable_thinking", "reasoning_effort", "drop_thinking"}
         if unknown:
             raise ValueError(f"Unsupported DeepSeek chat template kwargs: {sorted(unknown)}")
@@ -174,7 +249,6 @@ def _tokenizer(path, renderer, kwargs_json, hashes_json):
     return encode, pool
 
 
-
 def input_token_counter(config):
     """Return a lazy fallback that tokenizes a supported request as served."""
     tokenizer_path = Path(config["tokenizer"]).expanduser().resolve()
@@ -218,6 +292,7 @@ def input_token_counter(config):
         return len(encode(content))
 
     return count
+
 
 def _fit(encode, pool, rng, count, target, prefix="", compare=None):
     pieces = rng.choices(pool, k=max(1, count))
@@ -341,14 +416,34 @@ def _generate(directory, settings, requests, tokenizer_path, tokenizer_hashes, *
     }
 
 
-def _check_point(directory, settings, requests):
+def _point_fields(settings, requests, concurrency):
+    groups = settings["prefix_groups"]
+    return {
+        "settings": settings,
+        "profile": settings["profile"],
+        "concurrency": concurrency,
+        "isl": settings["isl"],
+        "osl": settings["osl"],
+        "prefix_tokens": settings["prefix_tokens"],
+        "prefix_groups": groups,
+        "warmup_requests": requests["warmup"],
+        "formal_requests": requests["formal"],
+        "formal_full_cycles": requests["formal"] // groups if groups else None,
+        "theoretical_shared_prefix_ratio": settings["prefix_tokens"] / settings["isl"],
+    }
+
+
+def _check_point(directory, expected):
     manifest_path = directory / "manifest.json"
     result = _load_json(manifest_path)
-    if result["settings"] != settings or any(result[f"{key}_requests"] != n for key, n in requests.items()):
-        raise ValueError(f"Frozen dataset configuration mismatch: {manifest_path}")
-    if set(result["files"]) != set(DATA_FILES):
+    for key, value in expected.items():
+        actual = result.get(key)
+        if key not in result or type(actual) is not type(value) or actual != value:
+            raise ValueError(f"Frozen dataset configuration mismatch for {key}: {manifest_path}")
+    files = result.get("files")
+    if not isinstance(files, dict) or set(files) != set(DATA_FILES):
         raise ValueError(f"Frozen dataset manifest lists unexpected files: {manifest_path}")
-    for filename, checksum in result["files"].items():
+    for filename, checksum in files.items():
         path = directory / filename
         if sha256(path) != checksum:
             raise ValueError(f"Frozen dataset SHA-256 mismatch: {path}")
@@ -359,6 +454,11 @@ def _check_point(directory, settings, requests):
         "warmup": directory / "warmup.jsonl",
         "order": directory / "order.jsonl",
     }
+
+
+def _check_snapshot(tokenizer_path, renderer, hashes):
+    if _tokenizer_hashes(tokenizer_path, renderer) != hashes:
+        raise ValueError(f"Tokenizer snapshot changed while generating data: {tokenizer_path}")
 
 
 def prepare_capacity_trial(config, directory, groups, seed, osl):
@@ -372,54 +472,64 @@ def prepare_capacity_trial(config, directory, groups, seed, osl):
 
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    files = ("prime.jsonl", "fill.jsonl", "probe.jsonl", "order.jsonl")
-    manifest = directory / "manifest.json"
-    if any((directory / name).exists() for name in (*files, manifest.name)):
-        raise FileExistsError(f"Calibration trial dataset already exists in {directory}")
+    with (directory / ".prepare.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        files = ("prime.jsonl", "fill.jsonl", "probe.jsonl", "order.jsonl")
+        manifest = directory / "manifest.json"
+        if any((directory / name).exists() for name in (*files, manifest.name)):
+            raise FileExistsError(f"Calibration trial dataset already exists in {directory}")
 
-    tokenizer_path = Path(config["tokenizer"]).expanduser().resolve()
-    renderer = config.get("chat_encoder", "deepseek")
-    tokenizer_hashes = _tokenizer_hashes(tokenizer_path, renderer)
-    isl, _, prefix_size = PROFILES["P03"]
-    settings = {
-        "dataset_version": DATASET_VERSION,
-        "profile": "P03",
-        "seed": seed,
-        "isl": isl,
-        "osl": osl,
-        "prefix_tokens": prefix_size,
-        "prefix_groups": groups,
-        "chat_encoder": renderer,
-        "chat_template_kwargs": config.get("chat_template_kwargs") or {},
-        "tokenizer_sha256": tokenizer_hashes,
-    }
-    fill_order = list(range(1, groups))
-    random.Random(_seed(seed, "cache-capacity", "fill")).shuffle(fill_order)
-    phase_orders = {"prime": [0], "fill": fill_order, "probe": [0]}
-    requests = {phase: len(order) for phase, order in phase_orders.items()}
-    with TemporaryDirectory(prefix=".building-", dir=directory) as temporary:
-        staging = Path(temporary)
-        checks = _generate(
-            staging, settings, requests, tokenizer_path, tokenizer_hashes, phase_orders=phase_orders,
-        )
-        result = {
-            "purpose": "gpu_prefix_cache_capacity",
-            "settings": settings,
-            "groups": groups,
+        tokenizer_path = Path(config["tokenizer"]).expanduser().resolve()
+        renderer = config.get("chat_encoder", "deepseek")
+        tokenizer_hashes = _tokenizer_hashes(tokenizer_path, renderer)
+        isl, _, prefix_size = PROFILES["P03"]
+        settings = {
+            "dataset_version": DATASET_VERSION,
+            "profile": "P03",
             "seed": seed,
             "isl": isl,
             "osl": osl,
             "prefix_tokens": prefix_size,
-            "requests": requests,
-            "tokenizer_version": importlib.metadata.version("tokenizers"),
-            "tokenizer_path_at_generation": str(tokenizer_path),
-            "generator_sha256": sha256(Path(__file__).resolve()),
-            "validation": checks,
-            "files": {name: sha256(staging / name) for name in files},
+            "prefix_groups": groups,
+            "chat_encoder": renderer,
+            "chat_template_kwargs": config.get("chat_template_kwargs") or {},
+            "tokenizer_sha256": tokenizer_hashes,
         }
-        _write_json(staging / manifest.name, result)
-        for name in (*files, manifest.name):
-            (staging / name).replace(directory / name)
+        fill_order = list(range(1, groups))
+        random.Random(_seed(seed, "cache-capacity", "fill")).shuffle(fill_order)
+        phase_orders = {"prime": [0], "fill": fill_order, "probe": [0]}
+        requests = {phase: len(order) for phase, order in phase_orders.items()}
+        with TemporaryDirectory(prefix=".building-", dir=directory) as temporary:
+            staging = Path(temporary)
+            checks = _generate(
+                staging, settings, requests, tokenizer_path, tokenizer_hashes, phase_orders=phase_orders,
+            )
+            _check_snapshot(tokenizer_path, renderer, tokenizer_hashes)
+            result = {
+                "purpose": "gpu_prefix_cache_capacity",
+                "settings": settings,
+                "groups": groups,
+                "seed": seed,
+                "isl": isl,
+                "osl": osl,
+                "prefix_tokens": prefix_size,
+                "requests": requests,
+                "tokenizer_version": importlib.metadata.version("tokenizers"),
+                "tokenizer_path_at_generation": str(tokenizer_path),
+                "generator_sha256": sha256(Path(__file__).resolve()),
+                "validation": checks,
+                "files": {name: sha256(staging / name) for name in files},
+            }
+            _write_json(staging / manifest.name, result)
+            published = []
+            try:
+                for name in (*files, manifest.name):
+                    (directory / name).hardlink_to(staging / name)
+                    published.append(name)
+            except BaseException:
+                for name in published:
+                    (directory / name).unlink()
+                raise
     return {**result, "manifest": manifest, **{name[:-6]: directory / name for name in files}}
 
 
@@ -430,27 +540,31 @@ def prepare(config, root, profile, concurrency, *, create=True):
     if type(concurrency) is not int or concurrency <= 0:
         raise ValueError("concurrency must be a positive integer")
     seed = config.get("seed", 20261125)
-    if type(seed) is not int:
-        raise ValueError("seed must be an integer")
+    if type(seed) is not int or seed < 0:
+        raise ValueError("seed must be a nonnegative integer")
     tokenizer_path = Path(config["tokenizer"]).expanduser().resolve()
     renderer = config.get("chat_encoder", "deepseek")
-    tokenizer_hashes = _tokenizer_hashes(tokenizer_path, renderer)
-    profile_dir = Path(root).expanduser().resolve() / profile
+    root = Path(root).expanduser().resolve()
+    profile_dir = root / profile
     directory = profile_dir / f"c{concurrency}"
-    if not create and not (directory / "manifest.json").is_file():
+    manifest_path = directory / "manifest.json"
+    if not create and not manifest_path.is_file():
         raise ValueError(f"Frozen dataset is missing; run prepare first: {directory}")
+    cached = bool(PROFILES[profile][2])
+    lock_path = root / ".prepare-cache.lock" if cached else profile_dir / ".prepare.lock"
     if create:
         profile_dir.mkdir(parents=True, exist_ok=True)
-    with (profile_dir / ".prepare.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with (lock_path.open("a") if create else nullcontext()) as lock:
+        if lock is not None:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        tokenizer_hashes = _tokenizer_hashes(tokenizer_path, renderer)
         baseline_path = profile_dir / "baseline.json"
-        baseline = _load_json(baseline_path) if baseline_path.exists() else None
-        if baseline is None:
-            # A point can have committed before its baseline was written if the process ended.
-            previous = next(iter(sorted(profile_dir.glob("c*/manifest.json"))), None)
-            if previous:
-                baseline = _load_json(previous)["settings"]
-        groups = _groups(config, profile, baseline)
+        baseline = _archived_settings(profile_dir, manifest_path)
+        sibling_capacity = None
+        if cached:
+            sibling = "P04" if profile == "P03" else "P03"
+            sibling_capacity = _derived_capacity(sibling, _archived_settings(root / sibling))
+        groups, baseline_capacity, origin = _groups(config, profile, baseline, sibling_capacity)
         isl, osl, prefix_size = PROFILES[profile]
         settings = {
             "dataset_version": DATASET_VERSION,
@@ -463,34 +577,24 @@ def prepare(config, root, profile, concurrency, *, create=True):
             "chat_encoder": renderer,
             "chat_template_kwargs": config.get("chat_template_kwargs") or {},
             "tokenizer_sha256": tokenizer_hashes,
-            "baseline_cache_capacity_tokens": (
-                baseline["baseline_cache_capacity_tokens"] if baseline
-                else config.get("cache_capacity_tokens") if groups
-                else None
-            ),
+            "baseline_cache_capacity_tokens": baseline_capacity,
         }
+        if origin is not None:
+            settings["prefix_groups_source"] = origin
         if baseline is not None and settings != baseline:
             raise ValueError(
                 f"{profile} dataset root already has a different frozen baseline: {baseline_path}"
             )
         requests = {"warmup": max(16, groups), "formal": max(3 * concurrency, 2 * groups)}
-        if not directory.exists():
+        fields = _point_fields(settings, requests, concurrency)
+        if create and not directory.exists():
             with TemporaryDirectory(prefix=".building-", dir=profile_dir) as temporary:
                 staging = Path(temporary) / "point"
                 staging.mkdir()
                 checks = _generate(staging, settings, requests, tokenizer_path, tokenizer_hashes)
+                _check_snapshot(tokenizer_path, renderer, tokenizer_hashes)
                 result = {
-                    "settings": settings,
-                    "profile": profile,
-                    "concurrency": concurrency,
-                    "isl": isl,
-                    "osl": osl,
-                    "prefix_tokens": prefix_size,
-                    "prefix_groups": groups,
-                    "warmup_requests": requests["warmup"],
-                    "formal_requests": requests["formal"],
-                    "formal_full_cycles": requests["formal"] // groups if groups else None,
-                    "theoretical_shared_prefix_ratio": prefix_size / isl,
+                    **fields,
                     "tokenizer_version": importlib.metadata.version("tokenizers"),
                     "tokenizer_path_at_generation": str(tokenizer_path),
                     "generator_sha256": sha256(Path(__file__).resolve()),
@@ -499,7 +603,7 @@ def prepare(config, root, profile, concurrency, *, create=True):
                 }
                 _write_json(staging / "manifest.json", result)
                 staging.rename(directory)
-        result = _check_point(directory, settings, requests)
+        result = _check_point(directory, fields)
         if create and not baseline_path.exists():
             temporary_path = profile_dir / ".baseline.tmp"
             _write_json(temporary_path, settings)

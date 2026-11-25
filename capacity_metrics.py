@@ -9,6 +9,38 @@ COMPLETIONS = "vllm:request_success_total"
 QUERIES = "vllm:prefix_cache_queries_total"
 GAUGES = {"vllm:num_requests_running": "running", "vllm:num_requests_waiting": "waiting"}
 TIERS = ("device", "host", "disk", "p2p", "external_unspecified")
+COUNTERS = {"completed", "queries", *TIERS}
+IDLE_GAUGES = tuple(GAUGES.values())
+
+
+def is_count(value):
+    return type(value) in (int, float) and value >= 0 and (
+        type(value) is int or value.is_integer()
+    )
+
+
+def validate_snapshot(engines):
+    """Require independent idleness and counter evidence for each engine."""
+    required = {"device", "completed", *IDLE_GAUGES}
+    if any("queries" in values for values in engines.values()):
+        required.add("queries")
+
+    for engine, values in engines.items():
+        missing = required - values.keys()
+        if missing:
+            raise ValueError(f"Engine {engine} lacks metric evidence: {', '.join(sorted(missing))}")
+
+        finish_reasons = values.get("finish_reasons")
+        if not isinstance(finish_reasons, dict) or not finish_reasons:
+            raise ValueError(f"Engine {engine} lacks request completion counters by finish reason")
+
+        for field in values.keys() & (COUNTERS | set(IDLE_GAUGES)):
+            if not is_count(values[field]):
+                raise ValueError(f"Invalid {field} value for engine {engine}: {values[field]}")
+        if any(not is_count(value) for value in finish_reasons.values()):
+            raise ValueError(f"Invalid finish reason counter for engine {engine}")
+        if values["completed"] != sum(finish_reasons.values()):
+            raise ValueError(f"Engine {engine} has inconsistent request completion counters")
 
 
 def parse_snapshot(exposition, model):
@@ -37,7 +69,7 @@ def parse_snapshot(exposition, model):
                     raise ValueError(f"{name} for engine {engine} lacks a finish reason")
                 values = values["finish_reasons"]
             value = sample.value
-            if value < 0 or not float(value).is_integer():
+            if not is_count(value):
                 raise ValueError(f"Invalid {name} value for engine {engine}: {value}")
             if metric in values:
                 raise ValueError(f"Duplicate {name} values for engine {engine}")
@@ -45,10 +77,9 @@ def parse_snapshot(exposition, model):
 
     if not engines:
         raise ValueError(f"No vLLM cache counters match model {model!r}")
-    for engine, values in engines.items():
-        if "device" not in values or not values["finish_reasons"]:
-            raise ValueError(f"Engine {engine} lacks local GPU hit or request completion counters")
+    for values in engines.values():
         values["completed"] = sum(values["finish_reasons"].values())
+    validate_snapshot(engines)
     return engines
 
 
@@ -63,14 +94,15 @@ def phase_delta(before, after, *, expected):
     """Check isolation and return counter deltas for a completed phase."""
     if not before or before.keys() != after.keys():
         raise ValueError("vLLM engine topology changed between metrics scrapes")
+    validate_snapshot(before)
+    validate_snapshot(after)
     per_engine = {}
     for engine, first in before.items():
         last = after[engine]
-        if any(values.get(field, 0) for values in (first, last) for field in ("running", "waiting")):
+        if any(values[field] for values in (first, last) for field in IDLE_GAUGES):
             raise ValueError(f"Engine {engine} had requests in flight at a phase boundary")
-        fields = {"device", "completed", "queries", *TIERS}
-        old = {key: value for key, value in first.items() if key in fields}
-        new = {key: value for key, value in last.items() if key in fields}
+        old = {key: value for key, value in first.items() if key in COUNTERS}
+        new = {key: value for key, value in last.items() if key in COUNTERS}
         if old.keys() != new.keys() or first["finish_reasons"].keys() != last["finish_reasons"].keys():
             raise ValueError(f"vLLM counter series changed on engine {engine}")
         delta = {key: value - old[key] for key, value in new.items()}

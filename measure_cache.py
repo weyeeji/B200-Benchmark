@@ -35,10 +35,18 @@ def validate_options(args, cfg):
         raise ValueError("hit-fraction must be in (0, 1]")
     if not 2 <= args.start_groups <= args.max_groups:
         raise ValueError("start-groups must be between 2 and max-groups")
-    if args.cache_affinity_header and not re.fullmatch(r"[A-Za-z0-9-]+", args.cache_affinity_header):
+    if args.cache_affinity_header and (
+        not re.fullmatch(r"[A-Za-z0-9-]+", args.cache_affinity_header)
+        or args.cache_affinity_header.lower() in {
+            "authorization", "cookie", "proxy-authorization", "host", "content-length",
+            "content-type", "transfer-encoding", "connection", "x-request-id", "x-correlation-id",
+        }
+    ):
         raise ValueError("Invalid cache affinity header name")
     if (args.cache_affinity_key is not None or args.pin_fill) and not args.cache_affinity_header:
         raise ValueError("cache-affinity-key and pin-fill require cache-affinity-header")
+    if args.pin_fill and not args.cache_affinity_key:
+        raise ValueError("pin-fill requires one stable cache-affinity-key for the whole calibration")
     if args.cache_affinity_key is not None and not re.fullmatch(r"[A-Za-z0-9._-]+", args.cache_affinity_key):
         raise ValueError("Invalid cache affinity key")
     url = args.metrics_url or cfg["api_url"] + "/metrics"
@@ -98,6 +106,7 @@ def measure_trial(args, cfg, url, directory, groups, trial_number, seed):
         previous, prime = measure_phase(cfg, url, data, "prime", directory, headers=headers)
         primed_at = time.monotonic()
         result["prime_engine"] = prime["engine"]
+        result["monitored_engines"] = sorted(prime["per_engine"])
         if groups > 1:
             previous, fill = measure_phase(cfg, url, data, "fill", directory, previous,
                                            headers=headers if args.pin_fill else None)
@@ -157,14 +166,19 @@ def run_calibration(args, cfg, directory, url, run_seed):
         'vllm:prompt_tokens_cached_by_source_total{source="device"}',
         "cache_capacity_tokens": None, "tests": {}, "start_groups": args.start_groups,
         "cache_affinity_header": args.cache_affinity_header, "cache_affinity_key": args.cache_affinity_key,
-        "measurement_scope": "single_engine_per_trial" if args.pin_fill else "serving_endpoint",
+        "measurement_scope": "unverified",
+        "engine_capacity_tokens": None,
     }
     path = directory / "capacity.json"
     write_json(path, report)
     print(path, flush=True)
     rng = random.Random(run_seed)
 
+    engines = None
+    anchor = None
+
     def collect(groups):
+        nonlocal engines, anchor
         print(f"cache capacity: testing {groups} prefix group(s)", flush=True)
         samples = []
         for trial in range(1, args.calibration_trials + 1):
@@ -172,6 +186,20 @@ def run_calibration(args, cfg, directory, url, run_seed):
                                    rng.getrandbits(63))
             samples.append(result)
             if result["status"] != "observed":
+                break
+            current = result["monitored_engines"]
+            if engines is None:
+                engines = current
+                anchor = result["prime_engine"] if args.pin_fill or len(engines) == 1 else None
+                report["monitored_engines"] = engines
+                report["anchor_engine"] = anchor
+                report["measurement_scope"] = (
+                    "single_engine_endpoint" if len(engines) == 1 else
+                    "pinned_engine" if args.pin_fill else "multi_engine_routed_working_set"
+                )
+            if current != engines or (anchor is not None and result["prime_engine"] != anchor):
+                result.update(status="inconclusive", error="Engine coverage or pinned engine changed across trials")
+                write_json(directory / f"g{groups}-t{trial}" / "trial.json", result)
                 break
         point = {"trials": samples}
         report["tests"][str(groups)] = point
@@ -208,9 +236,14 @@ def run_calibration(args, cfg, directory, url, run_seed):
                               smallest_observed_failing_groups=high,
                               first_failed_working_set_tokens=None if high is None else high * PREFIX)
                 if status == "measured":
-                    report["cache_capacity_tokens"] = low * PREFIX
-                    if not args.pin_fill:
-                        report["derived_prefix_groups"] = {"P03": low // 2, "P04": 2 * low}
+                    if len(engines) == 1:
+                        report["cache_capacity_tokens"] = low * PREFIX
+                        if low >= 2:
+                            report["derived_prefix_groups"] = {"P03": low // 2, "P04": 2 * low}
+                    elif args.pin_fill:
+                        report["engine_capacity_tokens"] = low * PREFIX
+                    else:
+                        report["status"] = "routed_boundary_only"
     except KeyboardInterrupt:
         report["status"] = "interrupted"
         raise
@@ -218,7 +251,8 @@ def run_calibration(args, cfg, directory, url, run_seed):
         report["finished_utc"] = utc_now()
         write_json(path, report)
 
-    print(f"status={report['status']} cache_capacity_tokens={report['cache_capacity_tokens']}", flush=True)
+    print(f"status={report['status']} cache_capacity_tokens={report['cache_capacity_tokens']} "
+          f"engine_capacity_tokens={report['engine_capacity_tokens']}", flush=True)
     if report.get("last_error"):
         print(report["last_error"], flush=True)
     return 0 if report["status"] == "measured" else 2

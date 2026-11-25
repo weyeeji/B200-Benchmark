@@ -8,6 +8,7 @@ import json
 import math
 import os
 import platform
+import re
 import shutil
 import sys
 import traceback
@@ -18,6 +19,7 @@ from urllib.parse import urlsplit
 import dataset
 import measure_cache
 import metrics
+import report as result_report
 from runner import (SLA_TAGS, clear_cache, probe_eos, recommended_duration, run_aiperf,
                     sha256, utc_now, verify_dispatch, write_json)
 
@@ -44,7 +46,8 @@ DEFAULTS = {
 
 def options():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["prepare", "plan", "probe", "measure-cache", "pilot", "run"])
+    parser.add_argument("action", choices=["prepare", "plan", "probe", "measure-cache", "pilot", "run", "report"])
+    parser.add_argument("--from-run", nargs="+", type=Path, help="Run directories for a combined HTML report")
     parser.add_argument("--config", type=Path, default=HOME / "config.example.json")
     parser.add_argument("--api-url")
     parser.add_argument("--model")
@@ -82,9 +85,68 @@ def positive(value):
     return type(value) in (int, float) and math.isfinite(value) and value > 0
 
 
+def validate_prometheus(config):
+    urls, rules = config["urls"], config["rules"]
+    if not isinstance(urls, list) or any(not isinstance(url, str) for url in urls):
+        raise ValueError("prometheus.urls must be a list of HTTP(S) URLs")
+    if len(set(urls)) != len(urls):
+        raise ValueError("prometheus.urls must not repeat addresses")
+    for url in urls:
+        parsed = urlsplit(url)
+        if (parsed.scheme not in ("http", "https") or not parsed.hostname
+                or parsed.username is not None or parsed.query or parsed.fragment):
+            raise ValueError("Use explicit Prometheus HTTP(S) URLs without embedded credentials")
+    if not isinstance(rules, dict):
+        raise ValueError("prometheus.rules must be an object")
+    denominators = {
+        "ratio", "ratio_plus_one", "histogram_ratio", "gauge_difference",
+        "counter_rate_difference", "counter_delta_difference",
+    }
+    for name, configured in rules.items():
+        if name not in metrics.MONITORING_DEFAULTS and not re.fullmatch(r"prom_[a-z0-9_]+", name):
+            raise ValueError(f"Custom Prometheus fields must start with prom_: {name}")
+        choices = configured if isinstance(configured, list) else [configured]
+        if not choices:
+            raise ValueError(f"Prometheus rule list is empty: {name}")
+        for rule in choices:
+            if (not isinstance(rule, dict) or rule.get("kind") not in metrics.RULE_KINDS
+                    or not isinstance(rule.get("metric"), str) or not rule["metric"]):
+                raise ValueError(f"Invalid Prometheus rule kind or metric: {name}")
+            denominator = rule.get("denominator")
+            if denominator is not None or rule["kind"] in denominators:
+                if not isinstance(denominator, str) or not denominator:
+                    raise ValueError(f"Invalid Prometheus denominator: {name}")
+            if not positive(rule.get("scale", 1)):
+                raise ValueError(f"Prometheus scale must be positive: {name}")
+            for key in ("labels", "label_regex", "denominator_labels"):
+                mapping = rule.get(key, {})
+                if not isinstance(mapping, dict) or any(not isinstance(v, str) for v in mapping.values()):
+                    raise ValueError(f"Prometheus {key} must map labels to strings: {name}")
+            for pattern in rule.get("label_regex", {}).values():
+                try:
+                    re.compile(pattern)
+                except re.error as error:
+                    raise ValueError(f"Invalid Prometheus label pattern: {name}") from error
+            for key in ("endpoints", "ignore_labels"):
+                items = rule.get(key, [])
+                if not isinstance(items, list) or any(not isinstance(item, str) for item in items):
+                    raise ValueError(f"Prometheus {key} must be a list of strings: {name}")
+            if set(rule.get("endpoints", [])) - set(urls):
+                raise ValueError(f"Prometheus rule endpoints must be listed in prometheus.urls: {name}")
+
+
 def load_config(args):
     path = args.config.expanduser().resolve()
-    cfg = merge(DEFAULTS, json.loads(path.read_text(encoding="utf-8")))
+    custom = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(custom, dict):
+        raise ValueError("The configuration file must contain a JSON object")
+    cfg = merge(DEFAULTS, custom)
+    for key in ("prefix_groups", "sla"):
+        if not isinstance(cfg[key], dict):
+            raise ValueError(f"{key} must be an object")
+    for key in ("use_legacy_max_tokens", "per_chunk_usage"):
+        if type(cfg[key]) is not bool:
+            raise ValueError(f"{key} must be true or false")
     cfg.update({key: getattr(args, key) for key in vars(args)
                 if key in cfg and getattr(args, key) is not None})
     cfg["prefix_groups"] = cfg["prefix_groups"].copy()
@@ -117,16 +179,25 @@ def load_config(args):
         raise ValueError("Use positive ttft_ms, tpot_ms, itl_ms and/or e2el_ms for SLA")
     if not isinstance(cfg["chat_template_kwargs"], dict) or cfg["chat_encoder"] not in ("deepseek", "hf"):
         raise ValueError("Set chat_encoder and chat_template_kwargs for the serving template")
+    validate_prometheus(cfg["prometheus"])
     hook = cfg["cache_hook"]
     if not isinstance(hook["command"], list) or any(not isinstance(x, str) or not x for x in hook["command"]):
         raise ValueError("cache_hook.command must be an argv list of nonempty strings")
+    if type(hook["require_confirmed"]) is not bool:
+        raise ValueError("cache_hook.require_confirmed must be true or false")
     if not positive(hook["timeout_s"]):
         raise ValueError("cache_hook.timeout_s must be positive and finite")
     spec = cfg["deployment"]["speculative"]
     if spec["mode"] not in ("unknown", "off", "real", "simulated"):
         raise ValueError("Speculative mode must be unknown, off, real or simulated")
-    if spec["mode"] in ("real", "off") and spec["simulated_acceptance_length"] is not None:
-        raise ValueError("Simulated acceptance length conflicts with speculative mode")
+    simulated = spec["simulated_acceptance_length"]
+    if spec["mode"] == "simulated":
+        if not positive(simulated):
+            raise ValueError("Simulated mode requires a positive simulated_acceptance_length")
+    elif simulated is not None:
+        raise ValueError("simulated_acceptance_length requires speculative mode simulated")
+    if spec["draft_length"] is not None and (type(spec["draft_length"]) is not int or spec["draft_length"] < 1):
+        raise ValueError("Speculative draft length must be a positive integer")
     if cfg["api_url"] is not None:
         url = cfg["api_url"].rstrip("/").removesuffix("/v1/chat/completions").removesuffix("/v1")
         parsed = urlsplit(url)
@@ -153,7 +224,9 @@ def run_probe(args, cfg):
         raise ValueError("Set --eos-token-id to the model's actual integer EOS ID")
     output = Path(cfg["output_dir"])
     output.mkdir(parents=True, exist_ok=True)
-    report = probe_eos(cfg, eos_id)
+    with (HOME / ".benchmark.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        report = probe_eos(cfg, eos_id)
     report["tokenizer_json_sha256"] = sha256(Path(cfg["tokenizer"]) / "tokenizer.json")
     target = output / f"eos-probe-{uuid.uuid4().hex[:8]}.json"
     write_json(target, report)
@@ -165,7 +238,7 @@ def metadata(directory, cfg, kind):
     write_json(directory / "config.json", cfg)
     packages = {dist.metadata["Name"]: dist.version for dist in importlib.metadata.distributions()}
     paths = [HOME / name for name in ("benchmark.py", "runner.py", "dataset.py", "metrics.py",
-                                     "measure_cache.py", "capacity_metrics.py", "requirements.txt")]
+                                     "measure_cache.py", "capacity_metrics.py", "report.py", "requirements.txt")]
     write_json(directory / "experiment.json", {
         "created_utc": utc_now(), "kind": kind, "python": sys.version,
         "platform": platform.platform(), "host": platform.node(),
@@ -176,17 +249,21 @@ def metadata(directory, cfg, kind):
 def point_row(cfg, data, concurrency, repeat, directory, kind):
     spec = cfg["deployment"]["speculative"]
     return {
+        "report_schema": result_report.SCHEMA,
         "deployment": cfg["deployment"]["name"] or NA, "kind": kind,
         "model": cfg["model"], "api_url": cfg["api_url"], "profile": data["profile"],
         "concurrency": concurrency, "gpu_count": cfg["gpu_count"], "repeat": repeat,
         "duration_cap_s": cfg["duration_s"] if kind == "run" else NA,
+        "request_timeout_s": cfg["request_timeout_s"], "per_chunk_usage": cfg["per_chunk_usage"],
+        "sla_signature": json.dumps(cfg["sla"], sort_keys=True, separators=(",", ":")),
         "prefix_groups": data["prefix_groups"], "prefix_tokens": data["prefix_tokens"],
         "theoretical_shared_prefix_ratio": data["theoretical_shared_prefix_ratio"],
         "warmup_target_requests": data["warmup_requests"],
         "formal_target_requests": data["formal_requests"],
         "formal_planned_full_cycles": data["formal_full_cycles"] or NA,
         "dataset_manifest_sha256": sha256(data["manifest"]),
-        "dataset_formal_sha256": sha256(data["formal"]),
+        "dataset_formal_sha256": data["files"]["formal.jsonl"],
+        "dataset_warmup_sha256": data["files"]["warmup.jsonl"],
         "speculative_mode": spec["mode"], "speculative_algorithm": spec["algorithm"] or NA,
         "speculative_draft_length": spec["draft_length"] if spec["draft_length"] is not None else NA,
         "simulated_acceptance_length": (
@@ -226,8 +303,12 @@ def run_point(cfg, data, concurrency, repeat, directory, kind, eos):
         write_json(warmup / "validation.json", {"counts": warmup_counts, "dispatch": warmup_order})
         row["warmup_completed_requests"] = warmup_counts["completed_requests"]
         if (warmup_rc or warmup_order["status"] != "ordered"
+                or warmup_order["recorded"] != requested_warmup
                 or warmup_counts["completed_requests"] != requested_warmup):
             raise RuntimeError("Warmup requests failed or their dispatch order was not verified")
+        if (warmup_counts["isl_matching_requests"] != requested_warmup
+                or warmup_counts["osl_matching_requests"] != requested_warmup):
+            raise RuntimeError("Warmup server Usage did not confirm all target token lengths")
 
         rc = run_aiperf(cfg, data["formal"], formal, requested_formal, concurrency,
                         cfg["duration_s"] if kind == "run" else None, monitor=True)
@@ -240,6 +321,9 @@ def run_point(cfg, data, concurrency, repeat, directory, kind, eos):
             issues.append(f"AIPerf exited with status {rc}")
         if dispatch["status"] != "ordered" or dispatch["recorded"] != requested_formal:
             issues.append(f"Ordered request quota incomplete: {dispatch['recorded']}/{requested_formal}")
+    except KeyboardInterrupt:
+        issues.append("Run interrupted")
+        row["interrupted"] = True
     except Exception as error:
         issues.append(f"{type(error).__name__}: {error}")
         (directory / "error.log").write_text(traceback.format_exc(), encoding="utf-8")
@@ -257,13 +341,22 @@ def run_point(cfg, data, concurrency, repeat, directory, kind, eos):
         if (row["steady_seconds"] == NA or not isinstance(row["steady_completed_requests"], int)
                 or not row["steady_completed_requests"]):
             issues.append("No successful requests completed in the steady window")
+        peak = row.get("actual_concurrency_peak")
+        if type(peak) is int and peak > concurrency:
+            issues.append(f"Observed request concurrency exceeded target: {peak}/{concurrency}")
     except Exception as error:
         with (directory / "error.log").open("a", encoding="utf-8") as log:
             log.write(traceback.format_exc())
         issues.append(f"Could not reduce AIPerf artifacts: {error}")
 
     row["forced_eos_probe_status"] = eos["status"] if eos else "unverified"
-    row["valid_for_comparison"] = not issues and kind == "run"
+    comparison_notes = []
+    if row.get("cache_clear_status") != "confirmed":
+        comparison_notes.append("缓存清理未确认")
+    if row["forced_eos_probe_status"] != "verified_by_forced_eos":
+        comparison_notes.append("没有已通过的强制 EOS 对照")
+    row["comparison_notes"] = "；".join(comparison_notes) or NA
+    row["valid_for_comparison"] = not issues and not comparison_notes and kind == "run"
     row["status"] = "incomplete" if issues else ("pilot_only" if kind == "pilot" else "complete")
     row["issues"] = " | ".join(issues) or NA
     row["finished_utc"] = utc_now()
@@ -285,7 +378,7 @@ def run_experiment(cfg, points, kind):
     output.mkdir(parents=True, exist_ok=True)
     with (HOME / ".benchmark.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        run_id = utc_now().split(".", 1)[0].replace(":", "")
+        run_id = utc_now()[:19].replace(":", "")
         directory = output / f"{kind}-{run_id}-{uuid.uuid4().hex[:8]}"
         directory.mkdir()
         metadata(directory, cfg, kind)
@@ -298,7 +391,10 @@ def run_experiment(cfg, points, kind):
                 row = run_point(cfg, data, concurrency, repeat, point, kind, eos)
                 rows.append(row)
                 metrics.write_summaries(directory, rows)
+                result_report.write_report(directory / "report.html", rows)
                 print(f"{row['status']}  {row['issues']}", flush=True)
+                if row.get("interrupted"):
+                    return 130
         if kind == "pilot":
             completed = [row["last_dispatch_s"] for row in rows
                          if row["status"] == "pilot_only" and isinstance(row["last_dispatch_s"], (int, float))]
@@ -321,7 +417,7 @@ def run_cache_measurement(args, cfg):
     output.mkdir(parents=True, exist_ok=True)
     with (HOME / ".benchmark.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        run_id = utc_now().split(".", 1)[0].replace(":", "")
+        run_id = utc_now()[:19].replace(":", "")
         nonce = uuid.uuid4()
         directory = output / f"cache-capacity-{run_id}-{nonce.hex[:8]}"
         directory.mkdir()
@@ -329,10 +425,40 @@ def run_cache_measurement(args, cfg):
         return measure_cache.run_calibration(args, cfg, directory, url, cfg["seed"] ^ nonce.int)
 
 
+def compare_reports(paths, cfg):
+    if not paths:
+        raise ValueError("Pass --from-run followed by one or more run directories")
+    rows = []
+    seen = set()
+    for supplied in paths:
+        directory = supplied.expanduser().resolve()
+        if directory in seen:
+            raise ValueError(f"Duplicate run directory: {directory}")
+        seen.add(directory)
+        raw = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
+        if not isinstance(raw, list) or not raw or any(
+            not isinstance(row, dict) or row.get("report_schema") != result_report.SCHEMA for row in raw
+        ):
+            raise ValueError(f"Unsupported summary metric schema: {directory}")
+        rows.extend(row | {"run_source": directory.name} for row in raw)
+    rows.sort(key=lambda row: (row["profile"], row["concurrency"], row["run_source"], row["repeat"]))
+    directory = Path(cfg["output_dir"])
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = utc_now()[:19].replace(":", "")
+    target = directory / f"comparison-{stamp}-{uuid.uuid4().hex[:8]}.html"
+    result_report.write_report(target, rows, combined=True)
+    print(target, flush=True)
+    return 0
+
+
 def main():
     args = options()
     try:
         cfg = load_config(args)
+        if args.action == "report":
+            return compare_reports(args.from_run, cfg)
+        if args.from_run:
+            raise ValueError("--from-run is only used by report")
         if args.action == "probe":
             return run_probe(args, cfg)
         if args.action == "measure-cache":

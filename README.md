@@ -39,9 +39,9 @@ cp config.example.json config.local.json
 
 基准入口采用 vLLM Router 的 `consistent_hash` 策略时，可添加 `--cache-affinity-header X-Session-ID`。每轮首写与读回携带相同的亲和键，填充请求沿用入口的常规路由。若要测指定 engine，可同时传入 `--pin-fill --cache-affinity-key <亲和键>`，让首写、填充、读回都使用该键。所得 C 适用于单个 engine。已知大致容量时，可用 `--start-groups` 指定单组基准后的首个扫描组数。 [vLLM Router v0.1.16 路由文档](https://github.com/vllm-project/router/blob/v0.1.16/docs/load_balancing/README.md#consistent-hash)
 
-先测单组的实际 GPU 命中量，再逐档扩大组数并细测通过和失败的边界。每档默认重复 3 次，由 `--calibration-trials` 配置。默认通过阈值是单组基准命中量的 95%，由 `--hit-fraction` 配置。结果保存在 `results/cache-capacity-*/capacity.json`，其中 `lower_bound_tokens` 对应最大通过工作集，`first_failed_working_set_tokens` 对应最小失败工作集。状态为 `measured` 时，`cache_capacity_tokens` 给出可用的 C。达到扫描上限仍全部通过时，报告下界，可提高 `--max-groups` 后复测。
+先测单组的实际 GPU 命中量，再逐档扩大组数并细测通过和失败的边界。每档默认重复 3 次，由 `--calibration-trials` 配置。默认通过阈值是单组基准命中量的 95%，由 `--hit-fraction` 配置。结果保存在 `results/cache-capacity-*/capacity.json`，其中 `lower_bound_tokens` 对应最大通过工作集，`first_failed_working_set_tokens` 对应最小失败工作集。单 engine 入口测得的边界写入 `cache_capacity_tokens`。多 engine 入口若用固定亲和键将整轮请求锁定到同一个 engine，则把该 engine 的边界写入 `engine_capacity_tokens`。普通多 engine 路由的通过和失败边界以 `routed_boundary_only` 标记，用作该路由下的工作集观察。达到扫描上限仍全部通过时，报告下界，可提高 `--max-groups` 后复测。
 
-把 `cache_capacity_tokens` 写入基准配置，或在 `prepare --scenes P03 P04 --cache-capacity "$C"` 中传入。校准使用独立目录，正式数据集沿用首次冻结的内容和顺序。当前四卡服务的测量值只适用于该四卡部署。
+把 `cache_capacity_tokens` 写入基准配置，或在 `prepare --scenes P03 P04 --cache-capacity "$C"` 中传入。校准使用独立目录，正式数据集沿用首次冻结的内容和顺序。多 engine 基准部署可由操作者提供该部署实测的 C，或直接指定正式 P03、P04 的组数。
 
 ## 数据与流程
 
@@ -79,7 +79,7 @@ python benchmark.py run --config config.local.json --scenes P01 --concurrencies 
 
 随机样本来自实际 tokenizer 的可往返 Token 子集。生成器将 Token 解码成文本，以聊天模板重新编码并逐条核对长度与边界。HTTP 请求携带用户文本，服务端执行聊天渲染和 tokenization。P01/P02 各请求在模板固定开头之后即分叉。P03/P04 的共享 58,880 Token 包含模板开头，余下 6,656 Token 包含生成提示结尾。前缀组每个周期等频访问一次，周期内用固定种子打乱。每点保存 `manifest.json`、预热和正式 JSONL、跨阶段的 `order.jsonl`。运行和预实验会校验冻结文件，数据和 tokenizer 可随档案复制到其它客户端。
 
-每点先执行缓存 Hook，再用独立 AIPerf 进程完成预热。访问数为 `max(16, 前缀组数)`，前缀场景首先完整访问每组一次。预热并发上限 16。正式点用 native sequential 单轮会话、固定并发闭环、Streaming、服务器 Usage 及 `ignore_eos=true`，无 RPS 限制。请求配额是 `max(3 × 并发, 2 × 前缀组数)`。默认 300 秒是发包上限，请求配额先完成时提前停止发包。Pilot 保留同一配额和序列并放开发包时限，统一建议值以最慢点的最后发包时间加 25% 余量计算。正式运行因时限无法覆盖配额时，摘要标为 incomplete。以原始数据集顺序分配给 AIPerf 的序号会被核对，网络实际到达次序受并发影响。 [AIPerf 闭环调度与停止条件](https://docs.nvidia.com/aiperf/v0.14.0/benchmark-modes/load-generator-options-reference) [逐请求导出字段](https://docs.nvidia.com/aiperf/v0.14.0/tutorials/metrics-analysis/working-with-profile-export-files)
+每点先执行缓存 Hook，再用独立 AIPerf 进程完成预热。访问数为 `max(16, 前缀组数)`，前缀场景首先完整访问每组一次。预热并发上限 16，需逐请求校验 AIPerf 发放顺序和 Usage 长度。正式点用 native sequential 单轮会话、固定并发闭环、Streaming、服务器 Usage 及 `ignore_eos=true`，无 RPS 限制。请求配额是 `max(3 × 并发, 2 × 前缀组数)`。默认 300 秒是发包上限，请求配额先完成时提前停止发包。Pilot 保留同一配额和序列并放开发包时限，统一建议值以最慢点的最后发包时间加 25% 余量计算。正式运行因时限无法覆盖配额时，摘要标为 incomplete。正式记录按会话编号核对数据集序列及 AIPerf credit 发放时间。HTTP 请求的实际到达次序受并发影响。 [AIPerf 闭环调度与停止条件](https://docs.nvidia.com/aiperf/v0.14.0/benchmark-modes/load-generator-options-reference) [逐请求导出字段](https://docs.nvidia.com/aiperf/v0.14.0/tutorials/metrics-analysis/working-with-profile-export-files)
 
 ## 缓存清理
 
@@ -93,13 +93,21 @@ python benchmark.py run --config config.local.json --scenes P01 --concurrencies 
 
 ## 指标与产物
 
-每个实验写入独立的 `results/run-…/` 或 `results/pilot-…/`，包含 `summary.csv`、`summary.json`、环境版本和代码哈希。每个测试点的 `warmup/` 和 `formal/` 保存独立的 AIPerf 原始响应、记录、汇总、配置与日志。另有数据 manifest、Hook 回执和运行状态。逐请求错误可在 AIPerf 记录的 error 字段检索。
+每个实验写入独立的 `results/run-…/` 或 `results/pilot-…/`。用 `report.html` 浏览测试点表格和可展开的延迟分布。机器可读汇总为 `summary.csv` 和 `summary.json`，另存环境版本和代码哈希。每个测试点的 `warmup/` 和 `formal/` 保存独立的 AIPerf 原始响应、记录、汇总、配置与日志。另有数据 manifest、Hook 回执和运行状态。逐请求错误可在 AIPerf 记录的 error 字段检索。
 
-稳态窗口从观测到并发首次达到目标开始，到最后一个正式请求发出为止。稳态吞吐按这个窗口结束的请求和 Usage Token 总量计算。所有正式请求仍有有限等待时间，以保存 drain、失败和输出长度证据。AIPerf 原生备份保留其整个正式阶段的统计。摘要 TTFT、ITL、TPOT、E2EL 分位使用 AIPerf 的逐请求指标和时间戳。TPOT 使用整个响应结束前的解码耗时，ITL 采用内容间隔的逐 Token 平均估计。若服务支持 continuous usage，可设置 `per_chunk_usage=true`，使 AIPerf 使用首个内容块的累计 Token 数据，便于推测解码时更准确地估计 ITL。输出使用服务端 completion_tokens，包含 Thinking Token。缺少 Usage 时用拼接的 reasoning 与 content 作 tokenizer 估计，摘要标明来源。未观测到的指标写 `N/A`。 [AIPerf 指标定义](https://docs.nvidia.com/aiperf/v0.14.0/reference/ai-perf-metrics-reference)
+`status=complete` 表示压测执行和长度校验完成。用于严格对照的测试点要求 GPU、CPU、SSD 各级缓存清理确认，以及已通过的强制 EOS 对照。缺少验证时，报告会保留测量值并标注原因。部署变更后重新执行 EOS 探针。
+
+可将多次运行并列查看。比较表会提示同场景、同并发的数据集、运行协议或 SLA 差异。
+
+```bash
+python benchmark.py report --from-run results/run-a results/run-b
+```
+
+稳态窗口从观测到并发首次达到目标开始，到最后一个正式请求发出为止。稳态吞吐按这个窗口结束的请求和 Usage Token 总量计算。在途请求会保留完成、失败和输出长度证据。TTFT、平均 ITL、TPOT、E2EL 均保留稳态完成与全部正式请求两组分位数及样本数，后者用 `formal_` 前缀并包含 drain 完成请求。平均 ITL 的分位数在逐请求平均值上计算。TPOT 使用整个响应结束前的解码耗时。若服务支持 continuous usage，可设置 `per_chunk_usage=true`，使 AIPerf 使用首个内容块的累计 Token 数据，便于推测解码时更准确地估计 ITL。输出使用服务端 completion_tokens，包含 Thinking Token。缺少 Usage 时用拼接的 reasoning 与 content 作 tokenizer 估计，摘要标明来源。未观测到的指标写 `N/A`。 [AIPerf 指标定义](https://docs.nvidia.com/aiperf/v0.14.0/reference/ai-perf-metrics-reference)
 
 在 `sla` 填写任意组合的 `ttft_ms`、`tpot_ms`、`itl_ms`、`e2el_ms` 上限。Goodput 统计稳态中满足全部阈值的成功请求每秒数，达标率分母包括稳态完成及失败的请求。
 
-在 `prometheus.urls` 分别填写 worker/exposer 的完整 `/metrics` 地址。AIPerf 保存原始抓取结果，摘要使用稳态窗口内的时间序列，按标签与端点聚合 worker，计数器速率和比率至少需要两次稳态采样。对于已有指标名的 vLLM、SGLang、DCGM 和 node_exporter 可用默认规则。PD 传输、缓存逐级命中率/淘汰率/加载延迟及推测接受指标依赖被测端导出。摘要只聚合配置中显式列出的地址。AIPerf 可能自动抓取服务 origin 的默认指标地址，原始文件也会保留这些样本。可按配置如下覆盖规则，每批 worker 选择一个指标视图。
+在 `prometheus.urls` 分别填写 worker/exposer 的完整 `/metrics` 地址。AIPerf 保存原始抓取结果，摘要使用稳态窗口内的时间序列，按标签与端点聚合 worker，计数器速率和比率至少需要两次可对齐的稳态采样。脚本按发起时间还原同端点的采样顺序。无法解释的回退或缺失的 worker 数据会使对应聚合返回 `N/A`。请求 Usage 的缓存列与 Prometheus 的 `server_*` 缓存列使用各自的统计口径。主机网卡指标描述 exporter 观察到的主机流量。对于已有指标名的 vLLM、SGLang、DCGM 和 node_exporter 可用默认规则。PD 传输、缓存逐级命中率/淘汰率/加载延迟及推测接受指标依赖被测端导出。摘要只聚合配置中显式列出的地址。AIPerf 可能自动抓取服务 origin 的默认指标地址，原始文件也会保留这些样本。可按配置覆盖已知规则，自定义字段使用 `prom_` 前缀。每批 worker 选择一个指标视图。
 
 ```json
 {
@@ -123,6 +131,12 @@ python benchmark.py run --config config.local.json --scenes P01 --concurrencies 
 ```
 
 抓取主机与基线应保持一致，且按部署范围设置 GPU 设备标签和 exporter 范围。配置示例给出的地址为占位符。监控功能参见 [NVIDIA Server Metrics](https://docs.nvidia.com/aiperf/v0.14.0/server-metrics/server-metrics-collection)。
+
+## 回归测试
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
 
 ## GitHub Deploy Key
 
