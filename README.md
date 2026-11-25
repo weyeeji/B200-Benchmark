@@ -1,163 +1,134 @@
-# DeepSeek Serving 并发压测
+# CQ-B200 Benchmark
 
-Python 脚本为 NVIDIA AIPerf v0.14.0 准备固定数据、编排实验，并用原始记录计算稳态指标。请求经 OpenAI Chat Completions API 发送，部署参数由服务端维护。官方稳定版、PyPI 和标签源码均已核对。 [NVIDIA 文档](https://docs.nvidia.com/aiperf/v0.14.0/welcome-to-ai-perf-documentation) [官方 CLI](https://docs.nvidia.com/aiperf/v0.14.0/reference/command-line-options) [v0.14.0 源码](https://github.com/ai-dynamo/aiperf/tree/v0.14.0) [PyPI](https://pypi.org/project/aiperf/0.14.0/)
+在 gxeng 上通过 NVIDIA AIPerf 压测 DeepSeek-V4.1-Flash-1017 的 OpenAI 兼容流式 Chat Completions 服务。客户端通过 URL 接入已有部署。
 
-vLLM 的随机负载和缓存隔离说明、SGLang 的在线客户端延迟定义，以及 Dynamo 的固定请求形状对比方法也作为实现参考。 [vLLM Benchmark CLI](https://docs.vllm.ai/en/stable/benchmarking/cli/) [SGLang Benchmark and Profiling](https://docs.sglang.io/docs/developer_guide/benchmark_and_profiling) [Dynamo with AIPerf](https://docs.nvidia.com/dynamo/dev/cli/operations/benchmarking-with-ai-perf)
+## 实验
 
-## 环境与配置
+| 目录 | 工作负载 | 预热 | 正式阶段 |
+| --- | --- | --- | --- |
+| P01 | 重 Prefill，8192 输入 token，1024 输出 token | 10 条独立随机请求 | 闭环，并发 C，共 3 × C 条 |
+| P02 | 重 Decode，1024 输入 token，4096 输出 token | 10 条独立随机请求 | 闭环，并发 C，共 3 × C 条 |
+| P03 | AgentX，回放 SemiAnalysis 真实会话轨迹及子代理 | 轨迹快照引导，另加每路 10 条缓存压力预热请求 | C 路会话，发流 900 秒，最多再等 600 秒收尾 |
 
-新环境使用 Linux x86-64 和 Python 3.12。在项目目录执行以下命令。
+每项实验按 16、32、64、128、256 独立爬坡。首个 SLA 未达标或该档无法完成有效测量时，停止该实验的后续档位。最高通过档是本次已验证的并发。如果最高计划档仍通过，可以用更高档位继续测量。
 
-```bash
+## 使用
+
+~~~bash
+ssh cqzs
+cd /home/user/Benchmark
+
+# 打印完整计划和每档的 AIPerf argv
+.venv/bin/python benchmark.py plan
+.venv/bin/python benchmark.py plan --experiments P01 P02 --concurrency 16 32 64
+
+# 正式运行示例。把地址、模型 ID 和上下文上限换成目标服务实际值
+.venv/bin/python benchmark.py run \
+  --url http://inference.example:8000 \
+  --model DeepSeek-V4.1-Flash-1017 \
+  --max-context-length 262144 \
+  --metrics-url http://inference.example:8000/metrics
+~~~
+
+| 参数 | 默认或用法 |
+| --- | --- |
+| `plan` / `run` | `plan` 展开工作负载、输出路径和 AIPerf 参数。 `run` 发送请求并生成报告。 |
+| `--experiments` | 默认按 P01、P02、P03 顺序运行。可选择其中一个或多个，也可指定执行顺序。 |
+| `--concurrency` | 默认 `16 32 64 128 256`。传递递增且不重复的正整数。P01/P02 的 C 是最大在途请求数。P03 的 C 是并行轨迹路数，每路可包含子代理。 |
+| `--url` | `run` 必填。传 API 基础地址，AIPerf 按 Chat 端点追加 `/v1/chat/completions`。 |
+| `--model` | 默认为 `DeepSeek-V4.1-Flash-1017`，填写目标服务实际注册的模型 ID。 |
+| `--max-context-length` | 仅 P03。按轨迹记录的峰值输入加输出 token 剔除整条超限轨迹。省略时使用完整语料。服务有上下文限制时填实际值。 |
+| `--metrics-url` | 可选 Prometheus 地址，提供 KVCache 和推测解码计数器的备用来源。建议使用与目标实例和模型对应的指标地址。 |
+| `--seed` | 默认 42。P01/P02 用于随机文本，P03 用于轨迹回放的随机选择。 |
+| `--dataset-nonce` | 用于 P01/P02 区分运行。默认取运行时间戳，生成新的冷前缀。跨独立缓存的部署做对比时，可复用相同的 nonce、seed 和档位。 |
+| `--request-timeout` | 单个 HTTP 请求超时时间，默认 600 秒。 |
+| `OPENAI_API_KEY` | 有鉴权时通过环境变量传入。 |
+
+### P01 和 P02
+
+可调整的工作负载参数在各目录的 `workload.json`。
+
+| 参数 | 用途 |
+| --- | --- |
+| `input_tokens` | 单请求完整聊天模板渲染后的输入长度，P01 为 8192，P02 为 1024。 |
+| `output_tokens` | 输出长度，P01 为 1024，P02 为 4096。每行 JSONL 的 `output_length` 提供请求输出上限，`min_tokens` 为同一值，`ignore_eos=true` 用于生成到此长度。 |
+| `warmup_requests` | 每档先发 10 条完整长度的请求，预热并发为 `min(C, 10)`。预热使用单独的数据文件与 AIPerf 进程。 |
+| `requests_per_concurrency` | 默认 3。正式请求数为 C 乘以该值。 |
+| `single_turn` / `sequential` | 顺序读取独立单轮请求，每条发一次。 |
+| `chat_template_kwargs` | P01/P02 固定 DeepSeek 的思考模板与 `high` 推理强度。生成时用本地 DeepSeek V4.1 renderer 按完整模板精确计数。 |
+| `cache_salt` | 每条请求有独立、可复现的缓存命名空间。支持该字段的引擎可从第一块隔离缓存。 |
+
+随机用户文本在输入开头分散前缀。预热、正式阶段和不同档用独立序列。正式请求用服务端的 `usage.prompt_tokens` 和 `usage.completion_tokens` 核验定长合同。请求数、服务端 Usage 或长度无法核验的档位会标为无效。实际缓存命中展示在结果中。
+
+### P03
+
+可调整的工作负载参数在 `P03/workload.json`。
+
+| 参数 | 用途 |
+| --- | --- |
+| `scenario` | `agentx` 使用 AIPerf 原生多轮闭环回放。按记录保留轨迹时序和子代理依赖。 |
+| `public_dataset` | `semianalysis_cc_traces_weka_062126`，日期固定的 Weka trace 语料，共 393 条根轨迹。 |
+| `profile_seconds` | 900 秒，正式阶段发新请求的时间。 |
+| `drain_seconds` | 600 秒，发流停止后等待已派发请求的时间。 |
+| `warmup_requests_per_lane` | 快照引导之后，每路再发送最多 10 条缓存压力预热请求。 |
+| `warmup_grace_seconds` | 1800 秒，原生轨迹预热的排空上限。 |
+| `cache_bust` | `first_turn_prefix` 给每次播放的首轮加唯一前缀，保留同一轨迹多轮间的缓存复用。 |
+| `ignore_eos` | 场景使用 `true`，沿用轨迹每一轮的输出预算。 |
+
+AIPerf 0.14.0 的 AgentX 预设还使用 0.25–0.75 的轨迹起点范围、300 秒的单轨迹空闲间隔上限、10 秒的系统空闲间隔上限，以及 10% 的运行时失败保护阈值。实时统计间隔为 30 秒，指标按 1 秒切片。原生导出保留场景有效性和过滤信息。
+
+### 公共 AIPerf 设置
+
+- `endpoint-type=chat`，`streaming` 开启，`tokenizer` 指向项目内的本地模型分词器。
+- `use-server-token-count` 请求并使用服务端流式 Usage。 `export-level=records` 导出聚合统计和逐请求指标。
+- `artifact-dir` 按运行、实验、档位和阶段分开。命令行使用 `ui=none`，控制台输出写入日志。GPU 遥测和 AIPerf 自带绘图关闭。
+- `server-metrics` 的自动抓取关闭。传 `--metrics-url` 时由脚本在测量前后抓取计数器。P01/P02 的抓取窗口覆盖正式阶段，P03 覆盖 AIPerf 原生预热到排空的整个过程。
+
+## 指标与 SLA
+
+| SLA | P50 | P90 | P99 |
+| --- | ---: | ---: | ---: |
+| TTFT | 5 s | 10 s | 30 s |
+| TPOT | 30 ms | 50 ms | 80 ms |
+
+- **TTFT** 取请求开始到首个有效推理或正文 token。**TPOT** 取每个请求首 token 后的完整输出时长除以剩余的输出 token 数（含推理 token），对逐请求结果计算百分位。六项阈值均满足时判为通过。
+- **输入、输出、总 TPM** 使用正式阶段服务端 Usage 汇总，以正式阶段首个请求到最后一个响应的实测时间（含收尾）换算每分钟。
+- **KVCache 命中率** 优先用正式请求的服务端已缓存输入 token 总数除以输入 token 总数。P03 的 90% 作为观察参考。
+- **推测解码接受率** 为接受的草稿 token 除以提议的草稿 token。**平均接受长度** 为每次验证平均接受的草稿 token 加 1。优先使用请求指标，备用计数器的范围和来源会标记。缺少数据时显示 N/A。
+- P01–P03 的推测解码行为取决于被测部署。如果部署使用 3.5 的模拟接受长度，比较各档和各部署时记录该条件。
+
+## 输出结构
+
+~~~text
+P01/workload.json
+P02/workload.json
+P03/workload.json
+logs/<UTC时间戳>/run.json
+logs/<UTC时间戳>/<Pxx>/C<并发>/{plan.json,warmup.log,formal.log,*.aiperf/}
+datasets/synthetic/<UTC时间戳>/<Pxx>/C<并发>/
+results/<UTC时间戳>/summary.csv
+results/<UTC时间戳>/report.html
+results/<UTC时间戳>/<Pxx>/C<并发>/<阶段>/
+~~~
+
+HTML 可离线打开，含每项实验的并发、时延、TPM、KVCache 与推测解码图表。每档完成即更新 CSV 和 HTML。原生 AIPerf 结果留在各阶段目录，原生进程日志归入各阶段的日志目录。日志中同时保存生成命令及随机数据指纹。数据集、模型分词器、虚拟环境、日志和结果由 `.gitignore` 忽略。
+
+## 客户端环境与离线数据
+
+服务器项目环境使用 Python 3.12.16 和 AIPerf 0.14.0。重建环境时可用 Python 3.12 及哈希锁定文件。
+
+~~~bash
 python3.12 -m venv .venv
 .venv/bin/python -m pip install --require-hashes -r requirements.txt
 .venv/bin/python -m pip check
-source .venv/bin/activate
-aiperf --version
-python benchmark.py --help
-cp config.example.json config.local.json
-```
+~~~
 
-已有离线 wheelhouse 时，在安装命令中加入 `--no-index --find-links .offline/wheels`。将被测模型的 tokenizer 快照放入 `tokenizer/` 或指定本地路径。DeepSeek 模式从快照内的 `encoding/vllm_encoding.py` 或 `encoding/encoding.py` 加载匹配服务端的聊天编码器。
+`tokenizer/` 内是目标 DeepSeek-V4.1-Flash-1017 的 `tokenizer.json`、相关配置、聊天模板与 `encoding/vllm_encoding.py`。固定长度依赖部署使用同一版本的分词器和 renderer。
 
-在 `config.local.json` 中填写服务地址、模型名、目标部署的实际 GPU 数量及部署说明。服务地址接受 HTTP(S) origin，或带 `/v1`、`/v1/chat/completions` 的形式。认证使用 `api_key_env` 指定的环境变量，默认 `OPENAI_API_KEY`。相对路径以配置文件所在目录为基准。示例配置使用 DeepSeek-V4.1-Flash-1017 tokenizer 和 DeepSeek 聊天编码器。默认发出 `chat_template_kwargs.thinking=true`，换部署时应确认对应模板及参数的语义。
+P03 读取 `datasets/huggingface/` 的 Hugging Face 离线缓存。重新准备时，将固定版本的 [traces.jsonl](https://huggingface.co/datasets/semianalysisai/cc-traces-weka-062126/resolve/23f152f6f0f9399a85901b89a6458def0ef16729/traces.jsonl) 下载到 `datasets/source/cc-traces-weka-062126/traces.jsonl`，然后在项目内执行：
 
-在 `deployment.name` 写入部署标识，在 `deployment.details` 记录 PD 拓扑、TP/DP/EP、缓存层、调度和算子优化等信息。使用 `deployment.speculative.mode` 的 `off`、`real`、`simulated` 或 `unknown`，并记录算法、草稿长度和模拟接受长度。配置仅用来标注实验。
+~~~bash
+.venv/bin/python P03/prepare_dataset.py
+~~~
 
-## 校准 GPU 前缀缓存容量 C
-
-在六卡基准部署可独占的时段运行容量校准。API 地址填写后续正式压测使用的入口。指标地址需要覆盖该入口路由到的全部 vLLM engine。下列地址是占位符，省略 `--metrics-url` 时默认读取 API origin 的 `/metrics`。
-
-```bash
-.venv/bin/python benchmark.py measure-cache --config config.local.json \
-  --api-url http://baseline.example:8000 \
-  --metrics-url http://vllm-metrics.example:8000/metrics \
-  --max-groups 32
-```
-
-每个候选工作集大小使用新生成的文本。AIPerf 以并发 1 闭环发送请求，先写入前缀 A，再写入 N−1 个独立前缀，最后用新后缀读回 A。每条请求的输入为 65,536 Token，其中前缀为 58,880 Token。短输出默认 8 Token，可用 `--calibration-osl` 指定。命中量取读回前后 vLLM `vllm:prompt_tokens_cached_by_source_total{source="device"}` 的增量。脚本按 engine 检查请求计数、首写与读回的路由，发现计数器异常、其他请求干扰或路由不稳定时记录为无法判定。 [vLLM 指标文档](https://docs.vllm.ai/en/latest/usage/metrics/#general-metrics)
-
-基准入口采用 vLLM Router 的 `consistent_hash` 策略时，可添加 `--cache-affinity-header X-Session-ID`。每轮首写与读回携带相同的亲和键，填充请求沿用入口的常规路由。若要测指定 engine，可同时传入 `--pin-fill --cache-affinity-key <亲和键>`，让首写、填充、读回都使用该键。所得 C 适用于单个 engine。已知大致容量时，可用 `--start-groups` 指定单组基准后的首个扫描组数。 [vLLM Router v0.1.16 路由文档](https://github.com/vllm-project/router/blob/v0.1.16/docs/load_balancing/README.md#consistent-hash)
-
-先测单组的实际 GPU 命中量，再逐档扩大组数并细测通过和失败的边界。每档默认重复 3 次，由 `--calibration-trials` 配置。默认通过阈值是单组基准命中量的 95%，由 `--hit-fraction` 配置。结果保存在 `results/cache-capacity-*/capacity.json`，其中 `lower_bound_tokens` 对应最大通过工作集，`first_failed_working_set_tokens` 对应最小失败工作集。单 engine 入口测得的边界写入 `cache_capacity_tokens`。多 engine 入口若用固定亲和键将整轮请求锁定到同一个 engine，则把该 engine 的边界写入 `engine_capacity_tokens`。普通多 engine 路由的通过和失败边界以 `routed_boundary_only` 标记，用作该路由下的工作集观察。达到扫描上限仍全部通过时，报告下界，可提高 `--max-groups` 后复测。
-
-多 engine 的均衡工作集校准可对每个 engine 指定一个不同的亲和键。下面是两个 engine 的示例，键值由部署的路由映射决定。
-
-```bash
-.venv/bin/python benchmark.py measure-cache --config config.local.json \
-  --cache-affinity-header X-Session-ID \
-  --engine-affinity 0=route-key-for-0 --engine-affinity 1=route-key-for-1 \
-  --start-groups 64 --max-groups 256
-```
-
-这个模式逐条验证首写、读回的 engine，填充阶段在各 engine 上并行，每个 engine 并发 1。组数参数按单个 engine 计。先用一次试验搜索，再用 `--calibration-trials` 指定的次数复验通过和失败边界。任一 engine 低于阈值即表示此均衡工作集失败。报告 `measurement_scope=balanced_working_set` 时，集群容量等于最大共同通过组数乘以 engine 数和 58,880。单组基线至少需覆盖理论前缀的 90%，可用 `--baseline-min-fraction` 调整。冷请求命中超出模板固定前缀、已导出的请求查询 Token 对不上，或路由映射发生偏差时，校准会保留现场数据以便排查。
-
-把 `cache_capacity_tokens` 写入基准配置，或在 `prepare --scenes P03 P04 --cache-capacity "$C"` 中传入。校准使用独立目录，正式数据集沿用首次冻结的内容和顺序。多 engine 基准部署可由操作者提供该部署实测的 C，或直接指定正式 P03、P04 的组数。
-
-## 数据与流程
-
-| 场景 | ISL | OSL | 理论共享前缀 | 剩余输入 | 工作集 |
-| --- | ---: | ---: | ---: | ---: | --- |
-| P01 | 4,096 | 1,024 | 0 | 4,096 | 独立随机输入 |
-| P02 | 65,536 | 600 | 0 | 65,536 | 独立随机输入 |
-| P03 | 65,536 | 600 | 58,880 | 6,656 | `floor(C / 117760)` 组 |
-| P04 | 65,536 | 600 | 58,880 | 6,656 | `ceil(2 × C / 58880)` 组 |
-
-第一次生成 P03/P04 时，设置初始基准部署实测的有效 GPU Prefix Cache 容量 `cache_capacity_tokens`，或明确给出 `prefix_groups.P03` 和 `prefix_groups.P04`。命令行对应 `--cache-capacity`、`--p03-groups` 和 `--p04-groups`。小工作集公式若得到零组，需明确选择可用的组数。后续部署复用首次冻结的组数、内容和访问顺序。
-
-```bash
-# P01/P02 的四个并发档位
-python benchmark.py prepare --scenes P01 P02
-
-# 将 C 的环境变量设置为初始基准部署实测的逻辑 Token 数
-python benchmark.py prepare --scenes P03 P04 --cache-capacity "$C"
-
-# 校验已有数据、冻结配置和 SHA-256
-python benchmark.py plan --config config.local.json
-
-# 低开销的流式 EOS 对照，随后把输出路径填入 eos_probe_file
-python benchmark.py probe --config config.local.json
-
-# 用完整请求配额跑预实验，得到所有选中测试点建议使用的统一发包时限
-python benchmark.py pilot --config config.local.json
-
-# 正式矩阵。若预实验需要更长时限，设置 duration_s 或传 --duration
-python benchmark.py run --config config.local.json
-
-# 单点示例
-python benchmark.py run --config config.local.json --scenes P01 --concurrencies 32 --repeats 2
-```
-
-随机样本来自实际 tokenizer 的可往返 Token 子集。生成器将 Token 解码成文本，以聊天模板重新编码并逐条核对长度与边界。HTTP 请求携带用户文本，服务端执行聊天渲染和 tokenization。P01/P02 各请求在模板固定开头之后即分叉。P03/P04 的共享 58,880 Token 包含模板开头，余下 6,656 Token 包含生成提示结尾。前缀组每个周期等频访问一次，周期内用固定种子打乱。每点保存 `manifest.json`、预热和正式 JSONL、跨阶段的 `order.jsonl`。运行和预实验会校验冻结文件，数据和 tokenizer 可随档案复制到其它客户端。
-
-每点先执行缓存 Hook，再用独立 AIPerf 进程完成预热。访问数为 `max(16, 前缀组数)`，前缀场景首先完整访问每组一次。预热并发上限 16，需逐请求校验 AIPerf 发放顺序和 Usage 长度。正式点用 native sequential 单轮会话、固定并发闭环、Streaming、服务器 Usage 及 `ignore_eos=true`，无 RPS 限制。请求配额是 `max(3 × 并发, 2 × 前缀组数)`。默认 300 秒是发包上限，请求配额先完成时提前停止发包。Pilot 保留同一配额和序列并放开发包时限，统一建议值以最慢点的最后发包时间加 25% 余量计算。正式运行因时限无法覆盖配额时，摘要标为 incomplete。正式记录按会话编号核对数据集序列及 AIPerf credit 发放时间。HTTP 请求的实际到达次序受并发影响。 审计逐请求核对冻结文件哈希、实际用户文本、模型、输出上限、Ignore EOS、模板参数和流式 Usage 设置。预热和正式压测都保存校验结果。P03/P04 沿用服务端实际路由，摘要以 `prefix_routing=managed_by_serving_endpoint` 标注。多 engine 路由可能将同组请求分散到不同 GPU Cache，比较结果时观察实际缓存命中率。 [AIPerf 闭环调度与停止条件](https://docs.nvidia.com/aiperf/v0.14.0/benchmark-modes/load-generator-options-reference) [逐请求导出字段](https://docs.nvidia.com/aiperf/v0.14.0/tutorials/metrics-analysis/working-with-profile-export-files)
-
-## 缓存清理
-
-把 `cache_hook.command` 写为由操作方提供的命令参数列表。Hook 的环境变量包含 `BENCHMARK_API_URL`、`BENCHMARK_MODEL`、`BENCHMARK_PROFILE`、`BENCHMARK_CONCURRENCY`、`BENCHMARK_REPEAT` 和 `BENCHMARK_ARTIFACT_DIR`。Hook 成功后应在 stdout 只写一个 JSON 对象，按实际状态报告每层，例如下例。
-
-```json
-{"gpu":"cleared","cpu":"cleared","ssd":"not_applicable","detail":"Backend confirmed the configured cache tiers."}
-```
-
-缺少 Hook 或层级确认时将该层标为 `unverified`。设置 `cache_hook.require_confirmed=true` 可强制校验所有层。理论共享前缀比例、Usage 里实际缓存/未缓存的 Token、服务端按层累计的缓存访问数据各有独立字段。P04 的首次访问覆盖所有组，驻留情况由服务端缓存策略决定。
-
-## 指标与产物
-
-每个实验写入独立的 `results/run-…/` 或 `results/pilot-…/`。打开 `report.html` 可按场景查看吞吐条形图、延迟分位图和请求完成情况。已有至少两个并发档位时，同时绘制稳态输出吞吐的扩展趋势。图下保留测试点表格和可展开的分位数明细。HTML 可离线打开。机器可读汇总为 `summary.csv` 和 `summary.json`，另存环境版本和代码哈希。每个测试点的 `warmup/` 和 `formal/` 保存独立的 AIPerf 原始响应、记录、汇总、配置与日志。另有数据 manifest、Hook 回执和运行状态。逐请求错误可在 AIPerf 记录的 error 字段检索。
-
-`status=complete` 表示压测执行和长度校验完成。用于严格对照的测试点要求 GPU、CPU、SSD 各级缓存清理确认，以及已通过的强制 EOS 对照。缺少验证时，报告会保留测量值并标注原因。部署变更后重新执行 EOS 探针。
-
-可将多次运行并列查看。比较表会提示同场景、同并发的数据集、运行协议或 SLA 差异。
-
-```bash
-python benchmark.py report --from-run results/run-a results/run-b
-```
-
-Prometheus 服务指标按被测模型筛选。多 worker 的计数比率使用匹配的系列和重叠采样区间。vLLM GPU 命中率以本地查询量为分母，CPU 或 SSD 的外部缓存命中率以外部查询量为分母。
-
-稳态窗口从观测到并发首次达到目标开始，到最后一个正式请求发出为止。稳态吞吐按这个窗口结束的请求和 Usage Token 总量计算。在途请求会保留完成、失败和输出长度证据。TTFT、平均 ITL、TPOT、E2EL 均保留稳态完成与全部正式请求两组分位数及样本数，后者用 `formal_` 前缀并包含 drain 完成请求。平均 ITL 的分位数在逐请求平均值上计算。TPOT 使用整个响应结束前的解码耗时。若服务支持 continuous usage，可设置 `per_chunk_usage=true`，使 AIPerf 使用首个内容块的累计 Token 数据，便于推测解码时更准确地估计 ITL。输出使用服务端 completion_tokens，包含 Thinking Token。缺少 Usage 时用拼接的 reasoning 与 content 作 tokenizer 估计，摘要标明来源。未观测到的指标写 `N/A`。 [AIPerf 指标定义](https://docs.nvidia.com/aiperf/v0.14.0/reference/ai-perf-metrics-reference)
-
-在 `sla` 填写任意组合的 `ttft_ms`、`tpot_ms`、`itl_ms`、`e2el_ms` 上限。Goodput 统计稳态中满足全部阈值的成功请求每秒数，达标率分母包括稳态完成及失败的请求。
-
-在 `prometheus.urls` 分别填写 worker/exposer 的完整 `/metrics` 地址。AIPerf 保存原始抓取结果，摘要使用稳态窗口内的时间序列，按标签与端点聚合 worker，计数器速率和比率至少需要两次可对齐的稳态采样。脚本按发起时间还原同端点的采样顺序。无法解释的回退或缺失的 worker 数据会使对应聚合返回 `N/A`。请求 Usage 的缓存列与 Prometheus 的 `server_*` 缓存列使用各自的统计口径。主机网卡指标描述 exporter 观察到的主机流量。对于已有指标名的 vLLM、SGLang、DCGM 和 node_exporter 可用默认规则。PD 传输、缓存逐级命中率/淘汰率/加载延迟及推测接受指标依赖被测端导出。摘要只聚合配置中显式列出的地址。AIPerf 可能自动抓取服务 origin 的默认指标地址，原始文件也会保留这些样本。可按配置覆盖已知规则，自定义字段使用 `prom_` 前缀。每批 worker 选择一个指标视图。
-
-```json
-{
-  "prometheus": {
-    "urls": ["http://worker1.example:8000/metrics", "http://worker2.example:8000/metrics", "http://telemetry.example:9400/metrics"],
-    "rules": {
-      "kv_transfer_latency_ms": {
-        "kind": "histogram_mean",
-        "metric": "your_kv_transfer_latency_seconds",
-        "scale": 1000
-      },
-      "gpu_cache_hit_rate": {
-        "kind": "ratio",
-        "metric": "your_gpu_cache_hits",
-        "denominator": "your_gpu_cache_lookups",
-        "labels": {"model_name": "your-model"}
-      }
-    }
-  }
-}
-```
-
-抓取主机与基线应保持一致，且按部署范围设置 GPU 设备标签和 exporter 范围。配置示例给出的地址为占位符。监控功能参见 [NVIDIA Server Metrics](https://docs.nvidia.com/aiperf/v0.14.0/server-metrics/server-metrics-collection)。
-
-## 回归测试
-
-```bash
-.venv/bin/python -m unittest discover -s tests -v
-```
-
-## GitHub Deploy Key
-
-公钥在 `~/.ssh/cq_b200_benchmark_github_ed25519.pub`。将其添加到目标仓库的 **Settings → Deploy keys**，用默认只读权限即可拉取。远端具备 GitHub 网络访问后，可对该仓库单独指定密钥。
-
-```bash
-git -c core.sshCommand="ssh -o IdentitiesOnly=yes -i $HOME/.ssh/cq_b200_benchmark_github_ed25519" \
-    clone git@github.com:OWNER/REPO.git
-git -C REPO config --local core.sshCommand \
-    "ssh -o IdentitiesOnly=yes -i $HOME/.ssh/cq_b200_benchmark_github_ed25519"
-```
+[AgentX 场景说明](https://github.com/ai-dynamo/aiperf/blob/main/docs/tutorials/agentx-mvp.md) · [AIPerf 导出格式](https://github.com/ai-dynamo/aiperf/blob/main/docs/tutorials/working-with-profile-exports.md)

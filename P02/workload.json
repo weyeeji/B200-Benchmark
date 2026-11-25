@@ -1,0 +1,6 @@
+{
+  "input_tokens": 1024,
+  "output_tokens": 4096,
+  "warmup_requests": 10,
+  "requests_per_concurrency": 3
+}
