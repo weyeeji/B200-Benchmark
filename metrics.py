@@ -345,7 +345,7 @@ def endpoint_key(url):
     return urlunsplit(parsed._replace(path=parsed.path if parsed.path not in ("", "/") else "/metrics"))
 
 
-def select_samples(artifact_dir, start, end, rule_index, urls=()):
+def select_samples(artifact_dir, start, end, rule_index, urls=(), *, model_name=None):
     """Retain the known series roster and complete observations inside the steady window."""
     series = defaultdict(lambda: defaultdict(list))
     if start is None or end is None:
@@ -370,8 +370,10 @@ def select_samples(artifact_dir, start, end, rule_index, urls=()):
         snapshot_metrics = snapshot.get("metrics") or {}
         for family in snapshot_metrics.keys() & rule_index:
             for sample in snapshot_metrics[family]:
-                labels = tuple(sorted((sample.get("labels") or {}).items()))
-                observations = series[family][(endpoint, labels)]
+                labels = sample.get("labels") or {}
+                if model_name is not None and "model_name" in labels and labels["model_name"] != model_name:
+                    continue
+                observations = series[family][(endpoint, tuple(sorted(labels.items())))]
                 if in_window:
                     observations.append((sent, sample))
     return series
@@ -420,15 +422,17 @@ def timeseries_measure(series, family, field, mode, labels, label_regex, endpoin
         values[key] = previous + value, times
     if endpoints and endpoints != samples_by_endpoint.keys():
         return {}
-    if not comparable_scrape_windows(samples_by_endpoint.values()):
+    if not comparable_scrape_windows(samples_by_endpoint.values(), require_overlap=mode != "gauge"):
         return {}
     return values
 
 
-def comparable_scrape_windows(windows):
-    """Allow polling skew when combining distinct endpoints on one steady window."""
+def comparable_scrape_windows(windows, *, require_overlap):
+    """Allow polling skew but require counters to span some shared time."""
     if len(windows) < 2:
         return True
+    if require_overlap and max(times[0] for times in windows) >= min(times[-1] for times in windows):
+        return False
     start = min(times[0] for times in windows)
     end = max(times[-1] for times in windows)
     for times in windows:
@@ -452,26 +456,24 @@ def evaluate_rule(series, rule):
         return timeseries_measure(series, name, field, mode, selected_labels, label_regex, endpoints, ignore)
 
     def matched(a, b):
-        if a and a.keys() == b.keys() and all(a[key][1] == b[key][1] for key in a):
-            return sum(item[0] for item in a.values()), sum(item[0] for item in b.values())
-        return None, None
+        if a.keys() == b.keys() and all(a[key][1] == b[key][1] for key in a):
+            return [(a[key][0], b[key][0]) for key in a]
+        return []
 
     if kind in ("ratio", "ratio_plus_one", "histogram_ratio", "histogram_mean"):
         field_a = "sum" if kind.startswith("histogram") else "value"
         field_b = "count" if kind == "histogram_mean" else field_a
-        a, b = matched(measure(family, field_a, "delta"),
-                       measure(denominator or family, field_b, "delta", True))
-        result = ratio(a, b)
-        if result != NA:
-            if kind == "ratio" and not 0 <= result <= 1:
-                return NA
-            return (result + (kind == "ratio_plus_one")) * scale
-        return NA
+        pairs = matched(measure(family, field_a, "delta"),
+                        measure(denominator or family, field_b, "delta", True))
+        if not pairs or (kind == "ratio" and any(a > b for a, b in pairs)):
+            return NA
+        result = ratio(sum(a for a, _ in pairs), sum(b for _, b in pairs))
+        return (result + (kind == "ratio_plus_one")) * scale if result != NA else NA
     if kind in ("gauge_difference", "counter_rate_difference", "counter_delta_difference"):
         mode = {"gauge_difference": "gauge", "counter_rate_difference": "rate",
                 "counter_delta_difference": "delta"}[kind]
-        a, b = matched(measure(family, "value", mode), measure(denominator, "value", mode, True))
-        return (a - b) * scale if a is not None and b is not None and a >= b else NA
+        pairs = matched(measure(family, "value", mode), measure(denominator, "value", mode, True))
+        return sum(a - b for a, b in pairs) * scale if pairs and all(a >= b for a, b in pairs) else NA
     if kind in ("gauge_sum", "gauge_mean"):
         values = [item[0] for item in measure(family, "value", "gauge").values()]
         if not values:
@@ -482,7 +484,7 @@ def evaluate_rule(series, rule):
     return sum(item[0] for item in values.values()) * scale if values else NA
 
 
-def server_summary(artifact_dir, start, end, config):
+def server_summary(artifact_dir, start, end, config, *, model_name=None):
     rules = {
         name: [
             {"kind": kind, "metric": family, "denominator": divisor, "scale": scale}
@@ -491,9 +493,12 @@ def server_summary(artifact_dir, start, end, config):
         for name, candidates in MONITORING_DEFAULTS.items()
     }
     for tier, source in zip(CACHE_TIERS, ("device", "host", "disk")):
-        rules[f"{tier}_cache_hit_rate"].insert(0, {
+        # The per-tier hits are recorded during scheduling. Pair them with
+        # scheduler queries for the same cache tier, not prefill-output counters.
+        queries = "vllm:prefix_cache_queries" if tier == "gpu" else "vllm:external_prefix_cache_queries"
+        rules[f"{tier}_cache_hit_rate"].append({
             "kind": "ratio", "metric": "vllm:prompt_tokens_cached_by_source",
-            "denominator": "vllm:prompt_tokens", "labels": {"source": source},
+            "denominator": queries, "labels": {"source": source},
             "denominator_labels": {}, "ignore_labels": ["source"],
         })
     for name, candidates in rules.items():
@@ -511,7 +516,8 @@ def server_summary(artifact_dir, start, end, config):
         rule[key] for candidates in rules.values() for rule in candidates
         for key in ("metric", "denominator") if rule.get(key)
     }
-    series = select_samples(artifact_dir, start, end, family_index, config.get("urls", []))
+    series = select_samples(artifact_dir, start, end, family_index, config.get("urls", []),
+                            model_name=model_name)
     result = {}
     for name, candidates in rules.items():
         result[name] = NA
@@ -525,7 +531,7 @@ def server_summary(artifact_dir, start, end, config):
 
 
 def summarize(artifact_dir, *, concurrency, gpu_count, isl, osl, sla=None,
-              prometheus=None, tokenizer_path=None, input_token_count=None):
+              prometheus=None, tokenizer_path=None, input_token_count=None, model_name=None):
     """Summarize successes and errors by completion during offered steady load."""
     artifact_dir = Path(artifact_dir)
     records = profiling_records(artifact_dir)
@@ -644,7 +650,7 @@ def summarize(artifact_dir, *, concurrency, gpu_count, isl, osl, sla=None,
         good = sum(all(req[name] <= limit for name, limit in sla.items()) for req in done)
     result["goodput_rps"] = ratio(good, steady_duration)
     result["sla_pass_rate"] = ratio(good, len(finalized))
-    result.update(server_summary(artifact_dir, steady_start, steady_end, prometheus or {}))
+    result.update(server_summary(artifact_dir, steady_start, steady_end, prometheus or {}, model_name=model_name))
     for name in ("cached_input", "uncached_input"):
         result[f"{name}_source"] = "server_usage" if result[f"{name}_tps"] != NA else NA
     result["actual_cache_hit_rate_source"] = "server_usage" if result["actual_cache_hit_rate"] != NA else NA

@@ -372,8 +372,10 @@ def _generate(directory, settings, requests, tokenizer_path, tokenizer_hashes, *
                 raise ValueError(f"Could not make group {group} distinct near the chat template header")
         return prefixes[group]
 
-    # Generate shared prefixes in stable order independently of the request schedule.
-    for group in range(group_count):
+    # Calibration fill prompts are single-use, so only the anchor needs an
+    # independently fitted reusable prefix. Formal groups keep their full schedule.
+    shared_groups = range(group_count) if phase_orders is None else (0,)
+    for group in shared_groups:
         group_prefix(group)
 
     with (directory / "order.jsonl").open("w", encoding="utf-8") as orders:
@@ -385,17 +387,24 @@ def _generate(directory, settings, requests, tokenizer_path, tokenizer_hashes, *
                 )
                 for index, group in enumerate(order):
                     rng = random.Random(_seed(seed, scenario_seed, phase, "prompt", index))
-                    shared, prefix_digest = ("", None) if group is None else group_prefix(group)
-                    limit = template_head if group is None else prefix_size
-                    seen = early_signatures if group is None else suffix_signatures.setdefault(group, set())
-                    estimate = isl - template_overhead - (prefix_size - template_head if group is not None else 0)
+                    cold_fill = phase_orders is not None and phase == "fill"
+                    use_prefix = group is not None and not cold_fill
+                    shared, prefix_digest = group_prefix(group) if use_prefix else ("", None)
+                    limit = prefix_size if use_prefix else template_head
+                    seen = suffix_signatures.setdefault(group, set()) if use_prefix else early_signatures
+                    estimate = isl - template_overhead - (prefix_size - template_head if use_prefix else 0)
                     for _ in range(32):
                         own_text, ids = _fit(
                             encode, pool, rng, estimate, isl, prefix=shared,
                         )
                         if prefix_digest is not None and _token_hash(ids[:prefix_size]) != prefix_digest:
                             continue
-                        signature = ids[limit]
+                        if cold_fill:
+                            signature = tuple(ids[limit:limit + signature_size])
+                            if len(signature) != signature_size:
+                                continue
+                        else:
+                            signature = ids[limit]
                         if signature not in seen:
                             seen.add(signature)
                             break
@@ -505,6 +514,7 @@ def prepare_capacity_trial(config, directory, groups, seed, osl):
                 staging, settings, requests, tokenizer_path, tokenizer_hashes, phase_orders=phase_orders,
             )
             _check_snapshot(tokenizer_path, renderer, tokenizer_hashes)
+            checks["calibration_fill_mode"] = "single_use_independent"
             result = {
                 "purpose": "gpu_prefix_cache_capacity",
                 "settings": settings,

@@ -119,7 +119,8 @@ def aiperf_env(key_var, headers=None):
     return env
 
 
-def run_aiperf(cfg, dataset_file, artifact, count, concurrency, duration=None, monitor=False, *, headers=None):
+def run_aiperf(cfg, dataset_file, artifact, count, concurrency, duration=None, monitor=False, *,
+               headers=None, cancel_event=None):
     artifact.mkdir()
     command = aiperf_command(cfg, dataset_file, artifact, count, concurrency, duration, monitor, headers=headers)
     env = aiperf_env(cfg["api_key_env"], headers)
@@ -139,24 +140,42 @@ def run_aiperf(cfg, dataset_file, artifact, count, concurrency, duration=None, m
               "target_requests": count, "concurrency": concurrency, "duration_cap_s": duration}
     write_json(artifact / "invocation.json", status)
     try:
+        if cancel_event is not None and cancel_event.is_set():
+            status.update(returncode=130, interrupted=True)
+            return 130
         with (artifact / "stdout.log").open("wb") as out, (artifact / "stderr.log").open("wb") as err:
             child = subprocess.Popen(command, stdout=out, stderr=err, env=env,
                                      start_new_session=True)
             try:
-                status["returncode"] = child.wait()
-            except KeyboardInterrupt:
-                terminate_group(child, signal.SIGINT)
-                try:
-                    status["returncode"] = child.wait(timeout=20)
-                except subprocess.TimeoutExpired:
-                    terminate_group(child, signal.SIGKILL)
+                if cancel_event is None:
                     status["returncode"] = child.wait()
+                else:
+                    while not cancel_event.is_set():
+                        try:
+                            status["returncode"] = child.wait(timeout=0.25)
+                        except subprocess.TimeoutExpired:
+                            continue
+                        break
+                    else:
+                        stop_aiperf(child)
+                        status.update(returncode=130, interrupted=True)
+            except KeyboardInterrupt:
+                status["returncode"] = stop_aiperf(child)
                 status["interrupted"] = True
                 raise
     finally:
         status["finished_utc"] = utc_now()
         write_json(artifact / "invocation.json", status)
     return status["returncode"]
+
+
+def stop_aiperf(child):
+    terminate_group(child, signal.SIGINT)
+    try:
+        return child.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        terminate_group(child, signal.SIGKILL)
+        return child.wait()
 
 
 def terminate_group(child, sig):
@@ -188,6 +207,77 @@ def verify_dispatch(artifact, dataset_file):
         return result | {"status": "dispatch_mismatch"}
     elapsed = (timestamps[-1] - timestamps[0]) / 1e9 if len(timestamps) > 1 else None
     return result | {"status": "ordered", "last_dispatch_s": elapsed}
+
+
+def verify_payload(artifact, dataset_file, cfg, *, expected_sha256=None):
+    """Compare the AIPerf raw-export request body against each frozen dataset row."""
+    raw = artifact / f"{ARTIFACT}_raw.jsonl"
+    result = {"status": "no_raw_payloads", "recorded": 0, "verified": 0, "violations": []}
+    if not raw.is_file():
+        return result
+
+    # Keep only digests in memory. A single long-context point can contain
+    # hundreds of MiB of text and the raw export may contain responses too.
+    planned = []
+    dataset_hash = hashlib.sha256()
+    with dataset_file.open("rb") as stream:
+        for line in stream:
+            dataset_hash.update(line)
+            if line.strip():
+                row = json.loads(line)
+                planned.append(
+                    (row["session_id"], hashlib.sha256(row["text"].encode("utf-8")).digest(), row["output_length"])
+                )
+    if expected_sha256 is not None:
+        result["dataset_sha256"] = dataset_hash.hexdigest()
+        if result["dataset_sha256"] != expected_sha256:
+            return result | {"status": "dataset_changed", "expected_dataset_sha256": expected_sha256}
+    token_key = "max_tokens" if cfg["use_legacy_max_tokens"] else "max_completion_tokens"
+    stream_options = {"include_usage": True}
+    if cfg["per_chunk_usage"]:
+        stream_options["continuous_usage_stats"] = True
+    request_fields = {"model": cfg["model"], "stream": True, "stream_options": stream_options}
+    request_fields.update(request_settings(cfg))
+    seen = set()
+
+    for record in jsonl(raw):
+        result["recorded"] += 1
+        meta = (record.get("metadata") or {}) if isinstance(record, dict) else {}
+        index = meta.get("session_num") if isinstance(meta, dict) else None
+        problems = []
+        if type(index) is not int or not 0 <= index < len(planned) or index in seen:
+            problems.append("session_num")
+        else:
+            seen.add(index)
+            identifier, digest, limit = planned[index]
+            if meta.get("conversation_id") != identifier:
+                problems.append("conversation_id")
+            payload = record.get("payload")
+            if not isinstance(payload, dict):
+                problems.append("payload")
+            else:
+                messages = payload.get("messages")
+                message = messages[0] if isinstance(messages, list) and len(messages) == 1 else None
+                if (not isinstance(message, dict) or message.keys() != {"role", "content"}
+                        or message.get("role") != "user" or not isinstance(message.get("content"), str)
+                        or hashlib.sha256(message["content"].encode("utf-8")).digest() != digest):
+                    problems.append("messages")
+                fields = {**request_fields, token_key: limit}
+                names = (payload.keys() - {"messages"}) | fields.keys()
+                problems.extend(name for name in sorted(names)
+                                if name not in payload or name not in fields
+                                or json.dumps(payload[name], sort_keys=True) != json.dumps(fields[name], sort_keys=True))
+        if not problems:
+            result["verified"] += 1
+        elif len(result["violations"]) < 10:
+            result["violations"].append(
+                {"record": result["recorded"], "session_num": index if type(index) is int else None,
+                 "fields": problems}
+            )
+
+    if result["recorded"]:
+        result["status"] = "verified" if result["verified"] == result["recorded"] else "payload_mismatch"
+    return result
 
 
 def clear_cache(cfg, artifact, profile, concurrency, repeat):

@@ -1,5 +1,6 @@
 """Measure vLLM GPU prefix-cache capacity using AIPerf reuse-distance trials."""
 
+import argparse
 import math
 import random
 import re
@@ -10,9 +11,16 @@ from urllib.parse import urlsplit
 import capacity_metrics
 import dataset
 from metrics import record_counts
-from runner import clear_cache, run_aiperf, utc_now, verify_dispatch, write_json
+from runner import clear_cache, run_aiperf, utc_now, verify_dispatch, verify_payload, write_json
 
 ISL, _, PREFIX = dataset.PROFILES["P03"]
+
+
+def engine_affinity(value):
+    engine, separator, key = value.partition("=")
+    if not separator or not all(re.fullmatch(r"[A-Za-z0-9._-]+", field) for field in (engine, key)):
+        raise argparse.ArgumentTypeError("Use ENGINE=KEY for each engine affinity")
+    return engine, key
 
 
 def add_arguments(parser):
@@ -23,6 +31,10 @@ def add_arguments(parser):
     group.add_argument("--cache-affinity-header", help="Send a stable routing key on each trial's anchor requests")
     group.add_argument("--cache-affinity-key", help="Override the generated routing key")
     group.add_argument("--pin-fill", action="store_true", help="Also route the fill to the anchor engine")
+    group.add_argument("--engine-affinity", action="append", type=engine_affinity, metavar="ENGINE=KEY",
+                       help="Repeat for every monitored engine to calibrate an equal working set per engine")
+    group.add_argument("--baseline-min-fraction", type=float, default=0.90,
+                       help="Minimum single-group GPU hit fraction of the 58880-token shared prefix")
     group.add_argument("--calibration-trials", type=int, default=3, help="Independent trials per size")
     group.add_argument("--hit-fraction", type=float, default=0.95, help="Fraction of single-group GPU hits required")
     group.add_argument("--calibration-osl", type=int, default=8, help="Short fixed output for each request")
@@ -31,8 +43,8 @@ def add_arguments(parser):
 def validate_options(args, cfg):
     if args.max_groups < 2 or args.calibration_trials < 1 or args.calibration_osl < 1:
         raise ValueError("Use max-groups >= 2, calibration-trials >= 1 and calibration-osl >= 1")
-    if not (0 < args.hit_fraction <= 1):
-        raise ValueError("hit-fraction must be in (0, 1]")
+    if not all(0 < value <= 1 for value in (args.hit_fraction, args.baseline_min_fraction)):
+        raise ValueError("hit-fraction and baseline-min-fraction must be in (0, 1]")
     if not 2 <= args.start_groups <= args.max_groups:
         raise ValueError("start-groups must be between 2 and max-groups")
     if args.cache_affinity_header and (
@@ -49,12 +61,47 @@ def validate_options(args, cfg):
         raise ValueError("pin-fill requires one stable cache-affinity-key for the whole calibration")
     if args.cache_affinity_key is not None and not re.fullmatch(r"[A-Za-z0-9._-]+", args.cache_affinity_key):
         raise ValueError("Invalid cache affinity key")
+    if args.engine_affinity:
+        routes = dict(args.engine_affinity)
+        if not args.cache_affinity_header or args.pin_fill or args.cache_affinity_key is not None:
+            raise ValueError("engine-affinity requires cache-affinity-header and its own routing keys")
+        if (len(routes) != len(args.engine_affinity) or len(set(routes.values())) != len(routes)
+                or len(routes) < 2):
+            raise ValueError("List at least two distinct engine labels and unique affinity keys")
     url = args.metrics_url or cfg["api_url"] + "/metrics"
     parsed = urlsplit(url)
     if (parsed.scheme not in ("http", "https") or not parsed.hostname
             or parsed.username is not None or parsed.query or parsed.fragment):
         raise ValueError("metrics-url must be an HTTP(S) endpoint with no embedded credentials or query")
     return url
+
+
+def execute_phase(cfg, data, name, artifact, evidence, *, headers=None, cancel_event=None):
+    count = data["requests"][name]
+    rc = run_aiperf(cfg, data[name], artifact, count, concurrency=1, headers=headers,
+                    cancel_event=cancel_event)
+    counts = record_counts(artifact, isl=data["isl"], osl=data["osl"])
+    order = verify_dispatch(artifact, data[name])
+    payload = verify_payload(artifact, data[name], cfg, expected_sha256=data["files"][f"{name}.jsonl"])
+    evidence.update(returncode=rc, counts=counts, dispatch=order, payload=payload)
+    if (rc or order["status"] != "ordered" or order["recorded"] != count
+            or payload["status"] != "verified" or payload["verified"] != count
+            or any(counts[field] != count for field in
+                   ("completed_requests", "isl_matching_requests", "osl_matching_requests"))):
+        raise ValueError(f"{name}: AIPerf status, order, wire payload or server Usage failed validation")
+
+
+def check_cache_delta(delta, data, count, phase):
+    queries = delta.get("queries")
+    if queries is not None and queries != count * data["isl"]:
+        raise ValueError(f"{phase}: query token count differs from the validated prompt lengths")
+    if phase in ("prime", "fill"):
+        validation = data["validation"]
+        inevitable_shared = (validation["template_common_header_tokens"]
+                             + (validation["cross_group_prefix_max_extra_tokens"] or 0))
+        hits = sum(delta.get(tier, 0) for tier in capacity_metrics.TIERS)
+        if hits > count * inevitable_shared:
+            raise ValueError(f"{phase}: unexpected cache hits in cold inputs")
 
 
 def measure_phase(cfg, url, data, name, trial_dir, previous=None, *, headers=None):
@@ -67,18 +114,16 @@ def measure_phase(cfg, url, data, name, trial_dir, previous=None, *, headers=Non
         evidence["before"] = before
         if previous is not None:
             capacity_metrics.phase_delta(previous, before, expected=0)
-        rc = run_aiperf(cfg, data[name], artifact, count, concurrency=1, headers=headers)
-        evidence["aiperf_returncode"] = rc
+        else:
+            capacity_metrics.phase_delta(before, before, expected=0)
+        attempt = {}
+        evidence["aiperf"] = attempt
+        execute_phase(cfg, data, name, artifact, attempt, headers=headers)
         after = capacity_metrics.snapshot(url, cfg["model"], timeout=5)
         evidence["after"] = after
-        counts = record_counts(artifact, isl=data["isl"], osl=data["osl"])
-        dispatch = verify_dispatch(artifact, data[name])
-        evidence.update(counts=counts, dispatch=dispatch)
-        if (rc or dispatch["status"] != "ordered" or dispatch["recorded"] != count
-                or counts["completed_requests"] != count or counts["isl_matching_requests"] != count
-                or counts["osl_matching_requests"] != count):
-            raise ValueError(f"{name}: AIPerf order, success or server Usage validation failed")
         evidence["delta"] = capacity_metrics.phase_delta(before, after, expected=count)
+        for row in evidence["delta"]["per_engine"].values():
+            check_cache_delta(row, data, row["completed"], name)
         return after, evidence["delta"]
     except (OSError, KeyError, ValueError, RuntimeError) as error:
         evidence["error"] = f"{type(error).__name__}: {error}"
@@ -157,6 +202,10 @@ def scan(assess, max_groups, start_groups=2):
 
 
 def run_calibration(args, cfg, directory, url, run_seed):
+    if getattr(args, "engine_affinity", None):
+        from balanced_cache import run_balanced
+
+        return run_balanced(args, cfg, directory, url, run_seed)
     report = {
         "status": "running", "created_utc": utc_now(), "api_url": cfg["api_url"], "model": cfg["model"],
         "metrics_url": url, "gpu_count_declared": cfg["gpu_count"], "concurrency": 1,
@@ -218,7 +267,9 @@ def run_calibration(args, cfg, directory, url, run_seed):
             reference = statistics.median(hits)
             threshold = math.ceil(reference * args.hit_fraction)
             report.update(single_group_gpu_hit_tokens=reference, gpu_hit_pass_threshold_tokens=threshold)
-            if not threshold or min(hits) < threshold:
+            min_fraction = getattr(args, "baseline_min_fraction", 0.90)
+            report["baseline_min_fraction"] = min_fraction
+            if reference < PREFIX * min_fraction or min(hits) < threshold:
                 baseline["outcome"] = report["status"] = "no_stable_gpu_hit_baseline"
             else:
                 baseline["outcome"] = "pass"

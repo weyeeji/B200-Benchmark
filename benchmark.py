@@ -21,7 +21,7 @@ import measure_cache
 import metrics
 import report as result_report
 from runner import (SLA_TAGS, clear_cache, probe_eos, recommended_duration, run_aiperf,
-                    sha256, utc_now, verify_dispatch, write_json)
+                    sha256, utc_now, verify_dispatch, verify_payload, write_json)
 
 HOME = Path(__file__).resolve().parent
 VERSION = "0.14.0"
@@ -238,7 +238,7 @@ def metadata(directory, cfg, kind):
     write_json(directory / "config.json", cfg)
     packages = {dist.metadata["Name"]: dist.version for dist in importlib.metadata.distributions()}
     paths = [HOME / name for name in ("benchmark.py", "runner.py", "dataset.py", "metrics.py",
-                                     "measure_cache.py", "capacity_metrics.py", "report.py",
+                                     "measure_cache.py", "balanced_cache.py", "capacity_metrics.py", "report.py",
                                      "report_charts.py", "report_trends.py", "requirements.txt")]
     write_json(directory / "experiment.json", {
         "created_utc": utc_now(), "kind": kind, "python": sys.version,
@@ -251,6 +251,7 @@ def point_row(cfg, data, concurrency, repeat, directory, kind):
     spec = cfg["deployment"]["speculative"]
     return {
         "report_schema": result_report.SCHEMA,
+        "server_metrics_semantics": 2,
         "deployment": cfg["deployment"]["name"] or NA, "kind": kind,
         "model": cfg["model"], "api_url": cfg["api_url"], "profile": data["profile"],
         "concurrency": concurrency, "gpu_count": cfg["gpu_count"], "repeat": repeat,
@@ -258,6 +259,7 @@ def point_row(cfg, data, concurrency, repeat, directory, kind):
         "request_timeout_s": cfg["request_timeout_s"], "per_chunk_usage": cfg["per_chunk_usage"],
         "sla_signature": json.dumps(cfg["sla"], sort_keys=True, separators=(",", ":")),
         "prefix_groups": data["prefix_groups"], "prefix_tokens": data["prefix_tokens"],
+        "prefix_routing": "managed_by_serving_endpoint" if data["prefix_groups"] else NA,
         "theoretical_shared_prefix_ratio": data["theoretical_shared_prefix_ratio"],
         "warmup_target_requests": data["warmup_requests"],
         "formal_target_requests": data["formal_requests"],
@@ -301,7 +303,11 @@ def run_point(cfg, data, concurrency, repeat, directory, kind, eos):
         row["warmup_returncode"] = warmup_rc
         warmup_counts = metrics.record_counts(warmup, isl=isl, osl=osl)
         warmup_order = verify_dispatch(warmup, data["warmup"])
-        write_json(warmup / "validation.json", {"counts": warmup_counts, "dispatch": warmup_order})
+        warmup_payload = verify_payload(warmup, data["warmup"], cfg,
+                                        expected_sha256=data["files"]["warmup.jsonl"])
+        write_json(warmup / "validation.json", {"counts": warmup_counts, "dispatch": warmup_order,
+                                                "wire_payload": warmup_payload})
+        row["warmup_wire_payload_status"] = warmup_payload["status"]
         row["warmup_completed_requests"] = warmup_counts["completed_requests"]
         if (warmup_rc or warmup_order["status"] != "ordered"
                 or warmup_order["recorded"] != requested_warmup
@@ -310,18 +316,26 @@ def run_point(cfg, data, concurrency, repeat, directory, kind, eos):
         if (warmup_counts["isl_matching_requests"] != requested_warmup
                 or warmup_counts["osl_matching_requests"] != requested_warmup):
             raise RuntimeError("Warmup server Usage did not confirm all target token lengths")
+        if warmup_payload["status"] != "verified" or warmup_payload["verified"] != requested_warmup:
+            raise RuntimeError("Warmup wire payloads did not match the frozen workload")
 
         rc = run_aiperf(cfg, data["formal"], formal, requested_formal, concurrency,
                         cfg["duration_s"] if kind == "run" else None, monitor=True)
         row["formal_returncode"] = rc
         dispatch = verify_dispatch(formal, data["formal"])
         write_json(formal / "dispatch.json", dispatch)
+        formal_payload = verify_payload(formal, data["formal"], cfg,
+                                        expected_sha256=data["files"]["formal.jsonl"])
+        write_json(formal / "payload-validation.json", formal_payload)
+        row["formal_wire_payload_status"] = formal_payload["status"]
         row["dispatch_order_status"] = dispatch["status"]
         row["last_dispatch_s"] = dispatch["last_dispatch_s"] if dispatch["last_dispatch_s"] is not None else NA
         if rc:
             issues.append(f"AIPerf exited with status {rc}")
         if dispatch["status"] != "ordered" or dispatch["recorded"] != requested_formal:
             issues.append(f"Ordered request quota incomplete: {dispatch['recorded']}/{requested_formal}")
+        if formal_payload["status"] != "verified" or formal_payload["verified"] != dispatch["recorded"]:
+            issues.append("Formal wire payloads did not match the frozen workload")
     except KeyboardInterrupt:
         issues.append("Run interrupted")
         row["interrupted"] = True
@@ -332,7 +346,7 @@ def run_point(cfg, data, concurrency, repeat, directory, kind, eos):
     try:
         row.update(metrics.summarize(formal, concurrency=concurrency, gpu_count=cfg["gpu_count"],
                                      isl=isl, osl=osl, sla=cfg["sla"], prometheus=cfg["prometheus"],
-                                     tokenizer_path=cfg["tokenizer"],
+                                     tokenizer_path=cfg["tokenizer"], model_name=cfg["model"],
                                      input_token_count=dataset.input_token_counter(cfg)))
         if row["completed_requests"] != requested_formal and formal.exists():
             issues.append("Formal request successes are below quota")

@@ -109,6 +109,8 @@ def coverage_notes(rows):
             notes.append(f"{profile} 并发 {concurrency} 的数据集或运行协议存在差异。")
         if len({row.get("sla_signature") for row in group}) != 1:
             notes.append(f"{profile} 并发 {concurrency} 的 SLA 阈值存在差异。")
+        if len({row.get("server_metrics_semantics") for row in group}) != 1:
+            notes.append(f"{profile} 并发 {concurrency} 的服务端指标聚合口径存在差异。")
     return notes
 
 

@@ -41,6 +41,17 @@ cp config.example.json config.local.json
 
 先测单组的实际 GPU 命中量，再逐档扩大组数并细测通过和失败的边界。每档默认重复 3 次，由 `--calibration-trials` 配置。默认通过阈值是单组基准命中量的 95%，由 `--hit-fraction` 配置。结果保存在 `results/cache-capacity-*/capacity.json`，其中 `lower_bound_tokens` 对应最大通过工作集，`first_failed_working_set_tokens` 对应最小失败工作集。单 engine 入口测得的边界写入 `cache_capacity_tokens`。多 engine 入口若用固定亲和键将整轮请求锁定到同一个 engine，则把该 engine 的边界写入 `engine_capacity_tokens`。普通多 engine 路由的通过和失败边界以 `routed_boundary_only` 标记，用作该路由下的工作集观察。达到扫描上限仍全部通过时，报告下界，可提高 `--max-groups` 后复测。
 
+多 engine 的均衡工作集校准可对每个 engine 指定一个不同的亲和键。下面是两个 engine 的示例，键值由部署的路由映射决定。
+
+```bash
+.venv/bin/python benchmark.py measure-cache --config config.local.json \
+  --cache-affinity-header X-Session-ID \
+  --engine-affinity 0=route-key-for-0 --engine-affinity 1=route-key-for-1 \
+  --start-groups 64 --max-groups 256
+```
+
+这个模式逐条验证首写、读回的 engine，填充阶段在各 engine 上并行，每个 engine 并发 1。组数参数按单个 engine 计。先用一次试验搜索，再用 `--calibration-trials` 指定的次数复验通过和失败边界。任一 engine 低于阈值即表示此均衡工作集失败。报告 `measurement_scope=balanced_working_set` 时，集群容量等于最大共同通过组数乘以 engine 数和 58,880。单组基线至少需覆盖理论前缀的 90%，可用 `--baseline-min-fraction` 调整。冷请求命中超出模板固定前缀、已导出的请求查询 Token 对不上，或路由映射发生偏差时，校准会保留现场数据以便排查。
+
 把 `cache_capacity_tokens` 写入基准配置，或在 `prepare --scenes P03 P04 --cache-capacity "$C"` 中传入。校准使用独立目录，正式数据集沿用首次冻结的内容和顺序。多 engine 基准部署可由操作者提供该部署实测的 C，或直接指定正式 P03、P04 的组数。
 
 ## 数据与流程
@@ -79,7 +90,7 @@ python benchmark.py run --config config.local.json --scenes P01 --concurrencies 
 
 随机样本来自实际 tokenizer 的可往返 Token 子集。生成器将 Token 解码成文本，以聊天模板重新编码并逐条核对长度与边界。HTTP 请求携带用户文本，服务端执行聊天渲染和 tokenization。P01/P02 各请求在模板固定开头之后即分叉。P03/P04 的共享 58,880 Token 包含模板开头，余下 6,656 Token 包含生成提示结尾。前缀组每个周期等频访问一次，周期内用固定种子打乱。每点保存 `manifest.json`、预热和正式 JSONL、跨阶段的 `order.jsonl`。运行和预实验会校验冻结文件，数据和 tokenizer 可随档案复制到其它客户端。
 
-每点先执行缓存 Hook，再用独立 AIPerf 进程完成预热。访问数为 `max(16, 前缀组数)`，前缀场景首先完整访问每组一次。预热并发上限 16，需逐请求校验 AIPerf 发放顺序和 Usage 长度。正式点用 native sequential 单轮会话、固定并发闭环、Streaming、服务器 Usage 及 `ignore_eos=true`，无 RPS 限制。请求配额是 `max(3 × 并发, 2 × 前缀组数)`。默认 300 秒是发包上限，请求配额先完成时提前停止发包。Pilot 保留同一配额和序列并放开发包时限，统一建议值以最慢点的最后发包时间加 25% 余量计算。正式运行因时限无法覆盖配额时，摘要标为 incomplete。正式记录按会话编号核对数据集序列及 AIPerf credit 发放时间。HTTP 请求的实际到达次序受并发影响。 [AIPerf 闭环调度与停止条件](https://docs.nvidia.com/aiperf/v0.14.0/benchmark-modes/load-generator-options-reference) [逐请求导出字段](https://docs.nvidia.com/aiperf/v0.14.0/tutorials/metrics-analysis/working-with-profile-export-files)
+每点先执行缓存 Hook，再用独立 AIPerf 进程完成预热。访问数为 `max(16, 前缀组数)`，前缀场景首先完整访问每组一次。预热并发上限 16，需逐请求校验 AIPerf 发放顺序和 Usage 长度。正式点用 native sequential 单轮会话、固定并发闭环、Streaming、服务器 Usage 及 `ignore_eos=true`，无 RPS 限制。请求配额是 `max(3 × 并发, 2 × 前缀组数)`。默认 300 秒是发包上限，请求配额先完成时提前停止发包。Pilot 保留同一配额和序列并放开发包时限，统一建议值以最慢点的最后发包时间加 25% 余量计算。正式运行因时限无法覆盖配额时，摘要标为 incomplete。正式记录按会话编号核对数据集序列及 AIPerf credit 发放时间。HTTP 请求的实际到达次序受并发影响。 审计逐请求核对冻结文件哈希、实际用户文本、模型、输出上限、Ignore EOS、模板参数和流式 Usage 设置。预热和正式压测都保存校验结果。P03/P04 沿用服务端实际路由，摘要以 `prefix_routing=managed_by_serving_endpoint` 标注。多 engine 路由可能将同组请求分散到不同 GPU Cache，比较结果时观察实际缓存命中率。 [AIPerf 闭环调度与停止条件](https://docs.nvidia.com/aiperf/v0.14.0/benchmark-modes/load-generator-options-reference) [逐请求导出字段](https://docs.nvidia.com/aiperf/v0.14.0/tutorials/metrics-analysis/working-with-profile-export-files)
 
 ## 缓存清理
 
@@ -102,6 +113,8 @@ python benchmark.py run --config config.local.json --scenes P01 --concurrencies 
 ```bash
 python benchmark.py report --from-run results/run-a results/run-b
 ```
+
+Prometheus 服务指标按被测模型筛选。多 worker 的计数比率使用匹配的系列和重叠采样区间。vLLM GPU 命中率以本地查询量为分母，CPU 或 SSD 的外部缓存命中率以外部查询量为分母。
 
 稳态窗口从观测到并发首次达到目标开始，到最后一个正式请求发出为止。稳态吞吐按这个窗口结束的请求和 Usage Token 总量计算。在途请求会保留完成、失败和输出长度证据。TTFT、平均 ITL、TPOT、E2EL 均保留稳态完成与全部正式请求两组分位数及样本数，后者用 `formal_` 前缀并包含 drain 完成请求。平均 ITL 的分位数在逐请求平均值上计算。TPOT 使用整个响应结束前的解码耗时。若服务支持 continuous usage，可设置 `per_chunk_usage=true`，使 AIPerf 使用首个内容块的累计 Token 数据，便于推测解码时更准确地估计 ITL。输出使用服务端 completion_tokens，包含 Thinking Token。缺少 Usage 时用拼接的 reasoning 与 content 作 tokenizer 估计，摘要标明来源。未观测到的指标写 `N/A`。 [AIPerf 指标定义](https://docs.nvidia.com/aiperf/v0.14.0/reference/ai-perf-metrics-reference)
 
