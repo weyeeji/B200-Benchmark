@@ -2,7 +2,7 @@
   "scenario": "agentx",
   "public_dataset": "semianalysis_cc_traces_weka_062126",
   "profile_seconds": 900,
-  "drain_seconds": 600,
+  "drain_seconds": 90,
   "warmup_requests_per_lane": 10,
   "warmup_grace_seconds": 1800,
   "cache_bust": "first_turn_prefix"
