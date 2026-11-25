@@ -14,7 +14,7 @@
 | P02 | 重 Decode，1024 输入 token，4096 输出 token | 10 条独立随机请求 | 闭环，并发 C，共 3 × C 条 |
 | P03 | AgentX，回放 SemiAnalysis 真实会话轨迹及子代理 | 轨迹快照引导，另加每路 10 条缓存压力预热请求 | C 路会话，发流 900 秒，最多再等 90 秒收尾 |
 
-每项实验按 16、32、64、128、256 独立爬坡。首个 SLA 未达标或该档无法完成有效测量时，停止该实验的后续档位。最高通过档是本次已验证的并发。如果最高计划档仍通过，可以用更高档位继续测量。
+每项实验按 16、32、64、128、256 独立爬坡。一个档位的各次运行全部有效且达标，该档才计入最高通过并发。任一轮无效或未达标后，该档的其余复测照常完成，随后的更高档停止。最高计划档通过时，可选择更高档位继续测量。
 
 ## 使用
 
@@ -38,6 +38,7 @@ cd /home/user/Benchmark
 | `plan` / `run` | `plan` 展开工作负载、输出路径和 AIPerf 参数。 `run` 发送请求并生成报告。 |
 | `--experiments` | 默认按 P01、P02、P03 顺序运行。可选择其中一个或多个，也可指定执行顺序。 |
 | `--concurrency` | 默认 `16 32 64 128 256`。传递递增且不重复的正整数。P01/P02 的 C 是最大在途请求数。P03 的 C 是并行轨迹路数，每路可包含子代理。 |
+| `--repeats` | 默认 1。仅 P01/P02，每档执行指定轮数。可用 `--experiments P01 P02 --concurrency 32 --repeats 3` 复测临界档。 |
 | `--url` | `run` 必填。传 API 基础地址，AIPerf 按 Chat 端点追加 `/v1/chat/completions`。 |
 | `--model` | 默认为 `DeepSeek-V4.1-Flash-1017`，填写目标服务实际注册的模型 ID。 |
 | `--max-context-length` | 仅 P03。按轨迹记录的峰值输入加输出 token 剔除整条超限轨迹。省略时使用完整语料。服务有上下文限制时填实际值。 |
@@ -45,6 +46,8 @@ cd /home/user/Benchmark
 | `--seed` | 默认 42。P01/P02 用于随机文本，P03 用于轨迹回放的随机选择。 |
 | `--dataset-nonce` | 用于 P01/P02 区分运行。默认取运行时间戳，生成新的冷前缀。跨独立缓存的部署做对比时，可复用相同的 nonce、seed 和档位。 |
 | `--request-timeout` | 单个 HTTP 请求超时时间，默认 600 秒。 |
+| `--backend-container` | 可选。本机 Docker 后端容器名，例如 `deepseek-v41-backend`。运行时记录镜像、GPU、并行和推测解码参数。 |
+| `--deployment-info` | 可选。提供部署说明 JSON，例如 `{"label":"DP4 基线","routing_policy":"consistent_hash","cache_start_state":"冷启动"}`。容器实测值覆盖同名手填字段。 |
 | `OPENAI_API_KEY` | 有鉴权时通过环境变量传入。 |
 
 ### P01 和 P02
@@ -61,7 +64,7 @@ cd /home/user/Benchmark
 | `chat_template_kwargs` | P01/P02 固定 DeepSeek 的思考模板与 `high` 推理强度。生成时用本地 DeepSeek V4.1 renderer 按完整模板精确计数。 |
 | `cache_salt` | 每条请求有独立、可复现的缓存命名空间。支持该字段的引擎可从第一块隔离缓存。 |
 
-随机用户文本在输入开头分散前缀。预热、正式阶段和不同档用独立序列。正式请求用服务端的 `usage.prompt_tokens` 和 `usage.completion_tokens` 核验定长合同。请求数、服务端 Usage 或长度无法核验的档位会标为无效。实际缓存命中展示在结果中。
+随机用户文本在输入开头分散前缀。预热、正式阶段、不同档和各次复测用独立序列。跨部署复现时，匹配 seed、nonce、档位与复测序号。首轮复测沿用基准 nonce，后续轮使用派生标识。正式请求用服务端的 `usage.prompt_tokens` 和 `usage.completion_tokens` 核验定长合同。请求数、服务端 Usage 或长度无法核验的档位会标为无效。实际缓存命中展示在结果中。
 
 ### P03
 
@@ -89,7 +92,7 @@ AIPerf 0.14.0 的 AgentX 预设还使用 0.25–0.75 的轨迹起点范围、300
 - `endpoint-type=chat`，`streaming` 开启，`tokenizer` 指向项目内的本地模型分词器。
 - `use-server-token-count` 请求并使用服务端流式 Usage。 `export-level=records` 导出聚合统计和逐请求指标。
 - `artifact-dir` 按运行、实验、档位和阶段分开。命令行使用 `ui=none`，控制台输出写入日志。GPU 遥测和 AIPerf 自带绘图关闭。
-- `server-metrics` 的自动抓取关闭。传 `--metrics-url` 时由脚本在测量前后抓取计数器。P01/P02 的抓取窗口覆盖正式阶段，P03 覆盖 AIPerf 原生预热到排空的整个过程。
+- 传 `--metrics-url` 后，脚本保留进程边界的 Prometheus 快照，按约 30 秒间隔记录活跃阶段的紧凑采样。P03 还在正式阶段边界采样，记录时间偏差和请求计数，供核对统计窗口。
 
 ## 指标与 SLA
 
@@ -100,10 +103,10 @@ AIPerf 0.14.0 的 AgentX 预设还使用 0.25–0.75 的轨迹起点范围、300
 | TTFT | 5 s | 10 s | 30 s |
 | TPOT | 30 ms | 50 ms | 80 ms |
 
-- **TTFT** 取请求开始到首个有效推理或正文 token。**TPOT** 取每个请求首 token 后的完整输出时长除以剩余的输出 token 数（含推理 token），对逐请求结果计算百分位。六项阈值均满足时判为通过。
+- **TTFT** 取请求开始到首个有效推理或正文 token。**TPOT** 取每个请求首 token 后的完整输出时长除以剩余的输出 token 数（含推理 token），对逐请求结果计算百分位。六项阈值均满足时，时延 SLA 判为通过。测量有效性单独记录。AIPerf 标记无效、收尾超时、取消请求或缺失必要数据时，保留部分指标和失败原因，该档排除在最大达标并发之外。
 - **输入、输出、总 TPM** 使用正式阶段服务端 Usage 汇总，以正式阶段首个请求到最后一个响应的实测时间（含收尾）换算每分钟。
-- **KVCache 命中率** 优先用正式请求的服务端已缓存输入 token 总数除以输入 token 总数。
-- **推测解码接受率** 为接受的草稿 token 除以提议的草稿 token。**平均接受长度** 为每次验证平均接受的草稿 token 加 1。优先使用请求指标，备用计数器的范围和来源会标记。缺少数据时显示 N/A。
+- **KVCache 命中率** 优先用正式请求的服务端已缓存输入 token 总数除以输入 token 总数。vLLM 可验证后端前端是否能通过 `--enable-prompt-tokens-details` 返回 `usage.prompt_tokens_details.cached_tokens`。用 `kv_usage_samples` 核对实际覆盖率。
+- **推测解码接受率** 为接受的草稿 token 除以提议的草稿 token。**平均接受长度** 为每次验证平均接受的草稿 token 加 1。优先使用请求指标。P03 的正式窗口采样与含预热的整场采样分别记录，附采样时间和计数对账。正式逐请求数据缺失时显示 N/A。P03 的 90% 正式目标使用正式请求的指标判读。
 
 ## 版本对比
 
@@ -116,9 +119,17 @@ AIPerf 0.14.0 的 AgentX 预设还使用 0.25–0.75 的轨迹起点范围、300
 | P01／P02 冷算 | 在独立缓存环境中复用同一 `--seed`、`--dataset-nonce` 和并发档位。核对预热与正式数据文件的 SHA-256、服务端实际 token 长度和 KVCache 命中情况。 |
 | P03 轨迹回放 | 保持数据集版本、seed、上下文过滤、发流与收尾时长、预热预算、会话路由和缓存起点一致。记录路由亲和设置和实际命中率。 |
 | 推测解码 | 记录草稿方法、每轮草稿数、真实或模拟接受方式，以及实测接受长度和接受率。需要控制接受率影响时，可在部署端把平均接受长度设为 **3.5 token/轮**，同组各版本采用相同方式。 |
-| 指标来源 | 固定服务端 Usage、Prometheus 指标和统计范围。P03 的 KVCache 命中率优先按正式请求的 Usage 计算，回退到 Prometheus 时记录其窗口含预热。 |
+| 指标来源 | 固定服务端 Usage、Prometheus 指标和统计范围。P03 的 KVCache 命中率优先按正式请求的 Usage 计算。对照 Prometheus 时匹配窗口和口径。 |
 
 P03 参照 InferenceX 扫点时，每档重启服务并使用新输出目录，通过 `--experiments P03 --concurrency C` 单独运行。当前脚本在同一实例上连续扫档时，需要固定扫档顺序和初始缓存状态，并在记录中注明。如果要复现已发布曲线，按对应测点的配方匹配时长、预热和路由。 [InferenceX AgentX 独立运行指南](https://github.com/SemiAnalysisAI/InferenceX/blob/main/inferencex-e2e/docs/agentx-standalone.md)
+
+用已有结果生成独立 HTML 和 CSV 对比页。命令接受服务器上的运行 ID 或结果目录，核对工作负载、数据指纹和运行条件后标注对比依据。旧运行缺少的条件在结果中标明。
+
+~~~bash
+.venv/bin/python compare_runs.py <基线运行ID> <候选运行ID>
+~~~
+
+默认写入 `results/comparisons/`，也可用 `--output` 指定新目录。
 
 ## 专项测试计划
 
@@ -151,14 +162,18 @@ P01/workload.json
 P02/workload.json
 P03/workload.json
 logs/<UTC时间戳>/run.json
-logs/<UTC时间戳>/<Pxx>/C<并发>/{plan.json,warmup.log,formal.log,*.aiperf/}
+logs/<UTC时间戳>/<Pxx>/C<并发>/{plan.json,status.json,*.phase.json,*.metrics.jsonl,warmup.log,formal.log,*.aiperf/}
 datasets/synthetic/<UTC时间戳>/<Pxx>/C<并发>/
+results/<UTC时间戳>/manifest.json
 results/<UTC时间戳>/summary.csv
 results/<UTC时间戳>/report.html
+results/<UTC时间戳>/<Pxx>/C<并发>/phase-summary.json
 results/<UTC时间戳>/<Pxx>/C<并发>/<阶段>/
 ~~~
 
-HTML 可离线打开，含每项实验的并发、时延、TPM、KVCache 与推测解码图表。每档完成即更新 CSV 和 HTML。原生 AIPerf 结果留在各阶段目录，原生进程日志归入各阶段的日志目录。日志中同时保存生成命令及随机数据指纹。数据集、模型分词器、虚拟环境、日志和结果由 `.gitignore` 忽略。
+多轮复测时，在并发档位下增加 R01、R02 等子目录。每轮完成后刷新 CSV 和离线 HTML，记录 SLA、测量有效性、来源和样本数。P03 时间轴用实际时钟显示 HTTP 在途请求、吞吐、时延和停止发流点。
+
+运行清单保存版本、模型、分词器与数据指纹、提供的部署参数和影响回放的环境设置。原生逐请求导出留在阶段结果目录，状态、阶段摘要、原生日志和采样记录留在对应日志目录。阶段摘要包括数据准备、预热、发流、实际收尾、截止时在途数和错误分类。数据集、模型分词器、虚拟环境、日志和结果由 .gitignore 忽略。
 
 ## 客户端环境与离线数据
 
