@@ -1,0 +1,12 @@
+.venv/
+.runtime/
+.offline/
+.validation/
+__pycache__/
+*.py[cod]
+.benchmark.lock
+datasets/
+results/
+tokenizer/
+config.local.json
+.env
