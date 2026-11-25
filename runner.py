@@ -53,7 +53,7 @@ def request_settings(cfg):
     return settings
 
 
-def aiperf_command(cfg, dataset_file, artifact, count, concurrency, duration=None, monitor=False):
+def aiperf_command(cfg, dataset_file, artifact, count, concurrency, duration=None, monitor=False, *, headers=None):
     command = [
         str(Path(sys.executable).with_name("aiperf")), "profile",
         "--model", cfg["model"], "--url", cfg["api_url"], "--endpoint-type", "chat",
@@ -68,6 +68,8 @@ def aiperf_command(cfg, dataset_file, artifact, count, concurrency, duration=Non
         "--export-level", "raw", "--no-export-outputs-json", "--no-auto-plot", "--ui", "none",
         "--extra-inputs", json.dumps(request_settings(cfg), separators=(",", ":")),
     ]
+    if headers:
+        command += ["--header", json.dumps(headers, separators=(",", ":"))]
     if cfg["use_legacy_max_tokens"]:
         command.append("--use-legacy-max-tokens")
     if cfg["per_chunk_usage"]:
@@ -90,9 +92,9 @@ def aiperf_command(cfg, dataset_file, artifact, count, concurrency, duration=Non
     return command
 
 
-def run_aiperf(cfg, dataset_file, artifact, count, concurrency, duration=None, monitor=False):
+def run_aiperf(cfg, dataset_file, artifact, count, concurrency, duration=None, monitor=False, *, headers=None):
     artifact.mkdir()
-    command = aiperf_command(cfg, dataset_file, artifact, count, concurrency, duration, monitor)
+    command = aiperf_command(cfg, dataset_file, artifact, count, concurrency, duration, monitor, headers=headers)
     env = os.environ.copy()
     key_var = cfg["api_key_env"]
     key = env.get(key_var) if key_var else None

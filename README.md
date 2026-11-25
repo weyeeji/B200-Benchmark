@@ -37,6 +37,8 @@ cp config.example.json config.local.json
 
 每个候选工作集大小使用新生成的文本。AIPerf 以并发 1 闭环发送请求，先写入前缀 A，再写入 N−1 个独立前缀，最后用新后缀读回 A。每条请求的输入为 65,536 Token，其中前缀为 58,880 Token。短输出默认 8 Token，可用 `--calibration-osl` 指定。命中量取读回前后 vLLM `vllm:prompt_tokens_cached_by_source_total{source="device"}` 的增量。脚本按 engine 检查请求计数、首写与读回的路由，发现计数器异常、其他请求干扰或路由不稳定时记录为无法判定。 [vLLM 指标文档](https://docs.vllm.ai/en/latest/usage/metrics/#general-metrics)
 
+基准入口采用 vLLM Router 的 `consistent_hash` 策略时，可添加 `--cache-affinity-header X-Session-ID`。每轮首写与读回携带相同的亲和键，填充请求沿用入口的常规路由。若要测指定 engine，可同时传入 `--pin-fill --cache-affinity-key <亲和键>`，让首写、填充、读回都使用该键。所得 C 适用于单个 engine。已知大致容量时，可用 `--start-groups` 指定单组基准后的首个扫描组数。 [vLLM Router v0.1.16 路由文档](https://github.com/vllm-project/router/blob/v0.1.16/docs/load_balancing/README.md#consistent-hash)
+
 先测单组的实际 GPU 命中量，再逐档扩大组数并细测通过和失败的边界。每档默认重复 3 次，由 `--calibration-trials` 配置。默认通过阈值是单组基准命中量的 95%，由 `--hit-fraction` 配置。结果保存在 `results/cache-capacity-*/capacity.json`，其中 `lower_bound_tokens` 对应最大通过工作集，`first_failed_working_set_tokens` 对应最小失败工作集。状态为 `measured` 时，`cache_capacity_tokens` 给出可用的 C。达到扫描上限仍全部通过时，报告下界，可提高 `--max-groups` 后复测。
 
 把 `cache_capacity_tokens` 写入基准配置，或在 `prepare --scenes P03 P04 --cache-capacity "$C"` 中传入。校准使用独立目录，正式数据集沿用首次冻结的内容和顺序。当前四卡服务的测量值只适用于该四卡部署。

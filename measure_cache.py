@@ -2,6 +2,7 @@
 
 import math
 import random
+import re
 import statistics
 import time
 from urllib.parse import urlsplit
@@ -18,6 +19,10 @@ def add_arguments(parser):
     group = parser.add_argument_group("measure-cache options")
     group.add_argument("--metrics-url", help="vLLM Prometheus URL (default: API origin /metrics)")
     group.add_argument("--max-groups", type=int, default=32, help="Largest working set to test")
+    group.add_argument("--start-groups", type=int, default=2, help="First size to test after the baseline")
+    group.add_argument("--cache-affinity-header", help="Send a stable routing key on each trial's anchor requests")
+    group.add_argument("--cache-affinity-key", help="Override the generated routing key")
+    group.add_argument("--pin-fill", action="store_true", help="Also route the fill to the anchor engine")
     group.add_argument("--calibration-trials", type=int, default=3, help="Independent trials per size")
     group.add_argument("--hit-fraction", type=float, default=0.95, help="Fraction of single-group GPU hits required")
     group.add_argument("--calibration-osl", type=int, default=8, help="Short fixed output for each request")
@@ -28,6 +33,14 @@ def validate_options(args, cfg):
         raise ValueError("Use max-groups >= 2, calibration-trials >= 1 and calibration-osl >= 1")
     if not (0 < args.hit_fraction <= 1):
         raise ValueError("hit-fraction must be in (0, 1]")
+    if not 2 <= args.start_groups <= args.max_groups:
+        raise ValueError("start-groups must be between 2 and max-groups")
+    if args.cache_affinity_header and not re.fullmatch(r"[A-Za-z0-9-]+", args.cache_affinity_header):
+        raise ValueError("Invalid cache affinity header name")
+    if (args.cache_affinity_key is not None or args.pin_fill) and not args.cache_affinity_header:
+        raise ValueError("cache-affinity-key and pin-fill require cache-affinity-header")
+    if args.cache_affinity_key is not None and not re.fullmatch(r"[A-Za-z0-9._-]+", args.cache_affinity_key):
+        raise ValueError("Invalid cache affinity key")
     url = args.metrics_url or cfg["api_url"] + "/metrics"
     parsed = urlsplit(url)
     if (parsed.scheme not in ("http", "https") or not parsed.hostname
@@ -36,7 +49,7 @@ def validate_options(args, cfg):
     return url
 
 
-def measure_phase(cfg, url, data, name, trial_dir, previous=None):
+def measure_phase(cfg, url, data, name, trial_dir, previous=None, *, headers=None):
     count = data["requests"][name]
     artifact = trial_dir / name
     path = trial_dir / f"{name}-metrics.json"
@@ -46,7 +59,7 @@ def measure_phase(cfg, url, data, name, trial_dir, previous=None):
         evidence["before"] = before
         if previous is not None:
             capacity_metrics.phase_delta(previous, before, expected=0)
-        rc = run_aiperf(cfg, data[name], artifact, count, concurrency=1)
+        rc = run_aiperf(cfg, data[name], artifact, count, concurrency=1, headers=headers)
         evidence["aiperf_returncode"] = rc
         after = capacity_metrics.snapshot(url, cfg["model"], timeout=5)
         evidence["after"] = after
@@ -67,27 +80,34 @@ def measure_phase(cfg, url, data, name, trial_dir, previous=None):
         write_json(path, evidence)
 
 
-def measure_trial(cfg, url, directory, groups, trial_number, seed, osl):
+def measure_trial(args, cfg, url, directory, groups, trial_number, seed):
     directory.mkdir()
     result = {"trial": trial_number, "seed": seed, "status": "inconclusive", "artifact_dir": str(directory)}
     try:
-        data = dataset.prepare_capacity_trial(cfg, directory, groups, seed, osl)
+        data = dataset.prepare_capacity_trial(cfg, directory, groups, seed, args.calibration_osl)
+        headers = None
+        if args.cache_affinity_header:
+            key = args.cache_affinity_key or f"capacity-{seed:016x}"
+            headers = {args.cache_affinity_header: key}
         cache = clear_cache(cfg, directory, "capacity", 1, trial_number)
         result["cache_clear"] = cache["status"]
         write_json(directory / "cache-clear.json", cache)
         if cfg["cache_hook"]["require_confirmed"] and cache["status"] != "confirmed":
             raise ValueError("Cache-clear tiers were not confirmed")
 
-        previous, prime = measure_phase(cfg, url, data, "prime", directory)
+        previous, prime = measure_phase(cfg, url, data, "prime", directory, headers=headers)
         primed_at = time.monotonic()
         result["prime_engine"] = prime["engine"]
         if groups > 1:
-            previous, fill = measure_phase(cfg, url, data, "fill", directory, previous)
+            previous, fill = measure_phase(cfg, url, data, "fill", directory, previous,
+                                           headers=headers if args.pin_fill else None)
             result["fill_requests_by_engine"] = {engine: row["completed"]
                                                  for engine, row in fill["per_engine"].items()}
+            if args.pin_fill and result["fill_requests_by_engine"].get(prime["engine"]) != groups - 1:
+                raise ValueError("The fill phase did not stay on the anchor engine")
         else:
             result["fill_requests_by_engine"] = {}
-        _, probe = measure_phase(cfg, url, data, "probe", directory, previous)
+        _, probe = measure_phase(cfg, url, data, "probe", directory, previous, headers=headers)
         result.update(probe_engine=probe["engine"], gpu_hit_tokens=probe["device_tokens"],
                       post_prime_through_probe_s=time.monotonic() - primed_at)
         if (prime["engine"] is None or prime["engine"] != probe["engine"]):
@@ -101,11 +121,11 @@ def measure_trial(cfg, url, directory, groups, trial_number, seed, osl):
     return result
 
 
-def scan(assess, max_groups):
+def scan(assess, max_groups, start_groups=2):
     """Return adjacent passing and failing sizes, or the tested lower bound."""
     low, high = 1, None
     while low < max_groups:
-        candidate = min(2 * low, max_groups)
+        candidate = min(start_groups if low == 1 else 2 * low, max_groups)
         outcome = assess(candidate)
         if outcome == "fail":
             high = candidate
@@ -135,7 +155,9 @@ def run_calibration(args, cfg, directory, url, run_seed):
         "prefix_tokens": PREFIX, "max_groups": args.max_groups, "trials_per_group_count": args.calibration_trials,
         "hit_fraction": args.hit_fraction, "run_seed": run_seed, "gpu_hit_metric":
         'vllm:prompt_tokens_cached_by_source_total{source="device"}',
-        "cache_capacity_tokens": None, "tests": {},
+        "cache_capacity_tokens": None, "tests": {}, "start_groups": args.start_groups,
+        "cache_affinity_header": args.cache_affinity_header, "cache_affinity_key": args.cache_affinity_key,
+        "measurement_scope": "single_engine_per_trial" if args.pin_fill else "serving_endpoint",
     }
     path = directory / "capacity.json"
     write_json(path, report)
@@ -146,8 +168,8 @@ def run_calibration(args, cfg, directory, url, run_seed):
         print(f"cache capacity: testing {groups} prefix group(s)", flush=True)
         samples = []
         for trial in range(1, args.calibration_trials + 1):
-            result = measure_trial(cfg, url, directory / f"g{groups}-t{trial}", groups, trial,
-                                   rng.getrandbits(63), args.calibration_osl)
+            result = measure_trial(args, cfg, url, directory / f"g{groups}-t{trial}", groups, trial,
+                                   rng.getrandbits(63))
             samples.append(result)
             if result["status"] != "observed":
                 break
@@ -181,13 +203,14 @@ def run_calibration(args, cfg, directory, url, run_seed):
                     write_json(path, report)
                     return point["outcome"]
 
-                low, high, status = scan(assess, args.max_groups)
+                low, high, status = scan(assess, args.max_groups, args.start_groups)
                 report.update(status=status, largest_passing_groups=low, lower_bound_tokens=low * PREFIX,
                               smallest_observed_failing_groups=high,
                               first_failed_working_set_tokens=None if high is None else high * PREFIX)
                 if status == "measured":
                     report["cache_capacity_tokens"] = low * PREFIX
-                    report["derived_prefix_groups"] = {"P03": low // 2, "P04": 2 * low}
+                    if not args.pin_fill:
+                        report["derived_prefix_groups"] = {"P03": low // 2, "P04": 2 * low}
     except KeyboardInterrupt:
         report["status"] = "interrupted"
         raise
